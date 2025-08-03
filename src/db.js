@@ -292,8 +292,13 @@ module.exports = {
     },
     creditUser: async (userId, amount, isUSDT = false) => {
         try {
+            console.log(`💰 Attempting to credit user ${userId} with ${amount} ${isUSDT ? 'USDT' : 'BNB'}`);
+            
             const update = isUSDT
-                ? { $inc: { usdtDeposited: parseFloat(amount) } }
+                ? { 
+                    $inc: { usdtDeposited: parseFloat(amount) },
+                    status: 'CONFIRMED'
+                }
                 : { $inc: { balance: parseFloat(amount) } };
 
             const deposit = await Deposit.findOneAndUpdate(
@@ -304,9 +309,16 @@ module.exports = {
 
             if (deposit) {
                 console.log(`💰 Credited user ${userId} with ${amount} ${isUSDT ? 'USDT' : 'BNB'}`);
-                await validateAndReleaseTokens(userId);
+                
+                // Always attempt to validate and release tokens
+                const tokensReleased = await validateAndReleaseTokens(userId);
+                
+                console.log(`🚀 Tokens released for user ${userId}: ${tokensReleased}`);
+                
                 return deposit;
             }
+            
+            console.log(`❌ No deposit found for user ${userId}`);
             return null;
         } catch (error) {
             console.error('Error crediting user:', error);

@@ -3,6 +3,7 @@ const { ethers } = require("ethers");
 const axios = require('axios');
 const Moralis = require("moralis").default;
 const { EvmChain } = require("@moralisweb3/common-evm-utils");
+const cron = require('node-cron');
 
 const {
     addDeposit,
@@ -111,6 +112,68 @@ async function fetchTokenTransfers(address) {
     }
 }
 
+// Function to process deposits and update status
+async function processDeposits() {
+    try {
+        console.log('🕒 Starting periodic deposit processing...');
+        
+        // Fetch pending deposits
+        const pendingDepositsResponse = await axios.get('http://localhost:3000/pending-deposits');
+        const deposits = pendingDepositsResponse.data.deposits;
+        
+        console.log(`🔍 Found ${deposits.length} pending deposits to process`);
+
+        // Process each deposit
+        for (const deposit of deposits) {
+            try {
+                // Check if the total received USDT matches the expected amount
+                const totalUSDTReceived = parseFloat(deposit.balances.usdt.totalReceived);
+                const expectedAmount = deposit.expectedAmount;
+
+                console.log(`Processing deposit for user ${deposit.userId}:`);
+                console.log(`Expected Amount: ${expectedAmount}`);
+                console.log(`Total USDT Received: ${totalUSDTReceived}`);
+
+                // Check if the deposit meets the expected amount
+                if (totalUSDTReceived >= expectedAmount) {
+                    // Update deposit status and credit tokens
+                    const depositToUpdate = await Deposit.findOne({ 
+                        userId: deposit.userId, 
+                        address: deposit.address 
+                    });
+
+                    if (depositToUpdate) {
+                        // Update deposit details
+                        depositToUpdate.status = 'CONFIRMED';
+                        depositToUpdate.usdtDeposited = totalUSDTReceived;
+                        
+                        // Save the updated deposit
+                        await depositToUpdate.save();
+
+                        // Credit tokens
+                        const updateResult = await creditUser(deposit.userId, expectedAmount, true);
+                        
+                        if (updateResult) {
+                            console.log(`✅ Deposit confirmed and tokens credited for user ${deposit.userId}`);
+                        }
+                    } else {
+                        console.log(`❌ Deposit not found for user ${deposit.userId}`);
+                    }
+                } else {
+                    console.log(`⚠️ Deposit for user ${deposit.userId} not yet validated`);
+                }
+            } catch (depositError) {
+                console.error(`Error processing deposit for user ${deposit.userId}:`, depositError);
+            }
+        }
+    } catch (error) {
+        console.error('❌ Error in periodic deposit processing:', error);
+    }
+}
+
+// Schedule the deposit processing task to run every minute
+cron.schedule('* * * * *', processDeposits);
+
 const app = express();
 app.use(express.json());
 
@@ -119,6 +182,19 @@ app.post("/generate-deposit", async (req, res) => {
     try {
         const { userId, expectedAmount } = req.body;
         if (!userId) return res.status(400).json({ error: "Missing userId" });
+
+        // Check for existing pending deposit for this user
+        const existingDeposit = await Deposit.findOne({ 
+            userId, 
+        });
+
+        if (existingDeposit) {
+            return res.status(400).json({
+                success: false,
+                message: "You already have an active deposit request. Please complete or cancel the existing deposit before creating a new one.",
+                existingDepositAddress: existingDeposit.address
+            });
+        }
 
         const wallet = ethers.Wallet.createRandom();
         const deposit = await addDeposit(userId, wallet.address, wallet.privateKey, expectedAmount);
