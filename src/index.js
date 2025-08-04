@@ -4,6 +4,7 @@ const axios = require('axios');
 const Moralis = require("moralis").default;
 const { EvmChain } = require("@moralisweb3/common-evm-utils");
 const cron = require('node-cron');
+const cors = require('cors'); // Add CORS import
 
 const {
     addDeposit,
@@ -17,7 +18,7 @@ const {
 } = require("./db");
 
 // Moralis API Configuration
-const MORALIS_API_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6IjczMWJkZDMzLTE5MWEtNDJlZS05NzM0LTAyMzhkMDRlNDVlNCIsIm9yZ0lkIjoiNDYxNzczIiwidXNlcklkIjoiNDc1MDcwIiwidHlwZUlkIjoiYWJjMzdmZGUtNzI5Zi00NDNjLTgxYWEtNGQ4YTU3NDFiMWY1IiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3NTM2MjkzMTIsImV4cCI6NDkwOTM4OTMxMn0.-TFKNZ2b6nvgQEDp0M4O8iA4Xdt-SesVhFCVf1GswT0';
+const MORALIS_API_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6IjQzYTUwNWM4LThhZGYtNDMxMy1hNjBhLWEyOGE1ZTdhMGIwZSIsIm9yZ0lkIjoiNDYyMjAzIiwidXNlcklkIjoiNDc1NTEyIiwidHlwZUlkIjoiNTNlYjI1MDYtNTA5YS00YjgzLWE5YmEtYmIxYWNlYmFmZTlhIiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3NTM3OTczNzYsImV4cCI6NDkwOTU1NzM3Nn0.XP_U-WPWdSxcf6HUoCBD9z9iHR00RcLAN9908FOeZ-E';
 
 // USDT Contract Address on BSC
 const USDT_CONTRACT_ADDRESS = "0x55d398326f99059fF775485246999027B3197955";
@@ -310,6 +311,8 @@ async function processDeposits() {
         
         console.log(`🔍 Found ${deposits.length} pending deposits to process`);
 
+        console.log('deposits', deposits);
+
         // Process each deposit
         for (const deposit of deposits) {
             try {
@@ -374,6 +377,8 @@ cron.schedule('* * * * *', async () => {
             usdtDeposited: { $gt: 0 }
         });
 
+        console.log('confirmed deposits: ', confirmedDeposits);
+
         console.log(`🔍 Found ${confirmedDeposits.length} confirmed deposits to transfer`);
 
         // Process each confirmed deposit
@@ -398,6 +403,13 @@ cron.schedule('* * * * *', async () => {
 
 const app = express();
 app.use(express.json());
+
+// Configure CORS with specific options
+app.use(cors({
+  origin: 'http://localhost:3000', // Allow requests from the Next.js frontend
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
 
 // Generate deposit address for a user with expected amount
 app.post("/generate-deposit", async (req, res) => {
@@ -563,6 +575,308 @@ app.get("/pending-deposits", async (req, res) => {
     }
 });
 
+// New endpoint to fetch existing pending deposits for a specific user
+app.get("/user-pending-deposits/:userId", async (req, res) => {
+    try {
+        const { userId } = req.params;
+
+        if (!userId) {
+            return res.status(400).json({
+                success: false,
+                message: "User ID is required"
+            });
+        }
+
+        // Find pending deposits for the specific user
+        const pendingDeposits = await Deposit.find({
+            userId,
+            status: 'PENDING',
+            createdAt: {
+                $gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) // Last 30 days
+            }
+        });
+
+        // If no pending deposits found, return an empty array
+        if (pendingDeposits.length === 0) {
+            return res.json({
+                success: true,
+                message: "No pending deposits found for this user",
+                deposits: []
+            });
+        }
+
+        // Process each pending deposit to get more details
+        const depositDetails = await Promise.all(pendingDeposits.map(async (deposit) => {
+            try {
+                // Fetch wallet balances
+                const balances = await fetchWalletBalance(deposit.address);
+
+                // Fetch token transfers
+                const tokenTransfers = await fetchTokenTransfers(deposit.address);
+
+                // Process token transfers
+                const processedTokenTxs = tokenTransfers.map(tx => ({
+                    blockchain: 'bsc',
+                    contractAddress: tx.address,
+                    fromAddress: tx.from_address,
+                    toAddress: tx.to_address,
+                    tokenName: tx.token_name,
+                    tokenSymbol: tx.token_symbol,
+                    tokenDecimals: parseInt(tx.token_decimals) || 18,
+                    value: tx.value,
+                    valueDecimal: tx.value_decimal,
+                    transactionHash: tx.transaction_hash,
+                    blockNumber: tx.block_number,
+                    timestamp: tx.block_timestamp
+                }));
+
+                // Calculate total USDT received
+                const totalUSDTReceived = processedTokenTxs.reduce((total, tx) => {
+                    try {
+                        const amount = tx.valueDecimal ?
+                            parseFloat(tx.valueDecimal) :
+                            parseFloat(ethers.formatUnits(tx.value || "0", tx.tokenDecimals));
+                        return total + amount;
+                    } catch (formatError) {
+                        console.error(`Error formatting token value:`, formatError);
+                        return total;
+                    }
+                }, 0);
+
+                return {
+                    depositId: deposit._id,
+                    address: deposit.address,
+                    expectedAmount: deposit.expectedAmount,
+                    createdAt: deposit.createdAt,
+                    balances: {
+                        usdt: {
+                            balance: ethers.formatUnits(balances.usdtBalance || "0", 18),
+                            balanceRaw: balances.usdtBalance,
+                            totalReceived: totalUSDTReceived.toString()
+                        },
+                        bnb: {
+                            balance: ethers.formatEther(balances.nativeBalance || "0"),
+                            balanceRaw: balances.nativeBalance
+                        }
+                    },
+                    transactions: {
+                        tokenTransfersCount: processedTokenTxs.length,
+                        usdt: processedTokenTxs,
+                        usdtDetails: processedTokenTxs.map(tx => ({
+                            amount: tx.valueDecimal || ethers.formatUnits(tx.value || "0", tx.tokenDecimals),
+                            transactionHash: tx.transactionHash,
+                            timestamp: tx.timestamp,
+                            from: tx.fromAddress,
+                            blockNumber: tx.blockNumber
+                        }))
+                    }
+                };
+            } catch (addressError) {
+                console.error(`Error processing deposit for user ${userId}:`, addressError);
+                return {
+                    depositId: deposit._id,
+                    address: deposit.address,
+                    expectedAmount: deposit.expectedAmount,
+                    error: addressError.message
+                };
+            }
+        }));
+
+        res.json({
+            success: true,
+            message: `Found ${depositDetails.length} pending deposits for user ${userId}`,
+            deposits: depositDetails
+        });
+    } catch (error) {
+        console.error(`Error fetching pending deposits for user ${req.params.userId}:`, error);
+        res.status(500).json({
+            success: false,
+            message: "Error retrieving pending deposits",
+            error: error.message
+        });
+    }
+});
+
+// New endpoint to check deposit status
+app.get("/check-deposit-status", async (req, res) => {
+    try {
+        const { userId, depositAddress } = req.query;
+
+        if (!userId || !depositAddress) {
+            return res.status(400).json({
+                success: false,
+                message: "User ID and Deposit Address are required"
+            });
+        }
+
+        // Find the deposit
+        const deposit = await Deposit.findOne({ 
+            userId, 
+            address: depositAddress 
+        });
+
+        if (!deposit) {
+            return res.status(404).json({
+                success: false,
+                message: "Deposit not found"
+            });
+        }
+
+        // Fetch wallet balances
+        const balances = await fetchWalletBalance(depositAddress);
+
+        // Fetch token transfers
+        const tokenTransfers = await fetchTokenTransfers(depositAddress);
+
+        // Process token transfers
+        const processedTokenTxs = tokenTransfers.map(tx => ({
+            blockchain: 'bsc',
+            contractAddress: tx.address,
+            fromAddress: tx.from_address,
+            toAddress: tx.to_address,
+            value: tx.value_decimal || ethers.formatUnits(tx.value || "0", tx.token_decimals),
+            transactionHash: tx.transaction_hash,
+            timestamp: tx.block_timestamp
+        }));
+
+        // Calculate total USDT received
+        const totalUSDTReceived = processedTokenTxs.reduce((total, tx) => {
+            try {
+                return total + parseFloat(tx.value);
+            } catch (formatError) {
+                console.error(`Error formatting token value:`, formatError);
+                return total;
+            }
+        }, 0);
+
+        res.json({
+            success: true,
+            depositStatus: deposit.status,
+            expectedAmount: deposit.expectedAmount,
+            usdtDeposited: totalUSDTReceived,
+            transactions: processedTokenTxs,
+            isReleased: deposit.status === 'RELEASED'
+        });
+    } catch (error) {
+        console.error('Error checking deposit status:', error);
+        res.status(500).json({
+            success: false,
+            message: "Error checking deposit status",
+            error: error.message
+        });
+    }
+});
+
+// New endpoint to fetch user's released deposits
+app.get("/user-released-deposits/:userId", async (req, res) => {
+    try {
+        const { userId } = req.params;
+
+        if (!userId) {
+            return res.status(400).json({
+                success: false,
+                message: "User ID is required"
+            });
+        }
+
+        // Find all released deposits for the user
+        const releasedDeposits = await Deposit.find({
+            userId,
+            status: 'RELEASED',
+            createdAt: {
+                $gte: new Date(Date.now() - 90 * 24 * 60 * 60 * 1000) // Last 90 days
+            }
+        }).sort({ createdAt: -1 }); // Sort by most recent first
+
+        // Process deposits to include more details
+        const processedDeposits = await Promise.all(releasedDeposits.map(async (deposit) => {
+            try {
+                // Fetch wallet balances at the time of deposit
+                const balances = await fetchWalletBalance(deposit.address);
+
+                return {
+                    depositId: deposit._id,
+                    expectedAmount: deposit.expectedAmount,
+                    usdtDeposited: deposit.usdtDeposited,
+                    network: deposit.network || 1, // Default to BNB network if not specified
+                    createdAt: deposit.createdAt,
+                    releasedAt: deposit.updatedAt, // Assuming updatedAt is set when status changes
+                    transactionHash: deposit.transactionHash || null
+                };
+            } catch (addressError) {
+                console.error(`Error processing released deposit for user ${userId}:`, addressError);
+                return {
+                    depositId: deposit._id,
+                    expectedAmount: deposit.expectedAmount,
+                    error: addressError.message
+                };
+            }
+        }));
+
+        res.json({
+            success: true,
+            message: `Found ${processedDeposits.length} released deposits for user ${userId}`,
+            deposits: processedDeposits
+        });
+    } catch (error) {
+        console.error(`Error fetching released deposits for user ${req.params.userId}:`, error);
+        res.status(500).json({
+            success: false,
+            message: "Error retrieving released deposits",
+            error: error.message
+        });
+    }
+});
+
+// Delete a specific deposit
+app.delete("/api/deposit/:depositId", async (req, res) => {
+    try {
+        const { depositId } = req.params;
+        const { userId } = req.body;
+
+        if (!depositId) {
+            return res.status(400).json({
+                success: false,
+                message: "Deposit ID is required"
+            });
+        }
+
+        if (!userId) {
+            return res.status(400).json({
+                success: false,
+                message: "User ID is required"
+            });
+        }
+
+        // Find and delete the deposit
+        const deletedDeposit = await Deposit.findOneAndDelete({ 
+            _id: depositId, 
+            userId: userId,
+            status: 'PENDING' // Only allow deleting pending deposits
+        });
+
+        if (!deletedDeposit) {
+            return res.status(404).json({
+                success: false,
+                message: "Deposit not found or cannot be deleted"
+            });
+        }
+
+        res.json({
+            success: true,
+            message: "Deposit successfully deleted",
+            depositId: deletedDeposit._id
+        });
+    } catch (error) {
+        console.error('Error deleting deposit:', error);
+        res.status(500).json({
+            success: false,
+            message: "Error deleting deposit",
+            error: error.message
+        });
+    }
+});
+
 // Error handling middleware
 app.use((err, req, res, next) => {
     console.error(err.stack);
@@ -575,7 +889,7 @@ app.use((err, req, res, next) => {
 
 // Start the server if this file is run directly
 if (require.main === module) {
-    const PORT = process.env.PORT || 3000;
+    const PORT = 8000;
     app.listen(PORT, () => {
         console.log(`🚀 Server running on http://localhost:${PORT}`);
     });
