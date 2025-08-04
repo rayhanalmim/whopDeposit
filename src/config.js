@@ -14,5 +14,10 @@ module.exports = {
     TREASURY_ADDRESS: process.env.TREASURY_ADDRESS,
     SWEEP_GAS_LIMIT: parseInt(process.env.SWEEP_GAS_LIMIT) || 21000,
     SWEEP_GAS_PRICE_GWEI: process.env.SWEEP_GAS_PRICE_GWEI || "3",
-    DB_PATH: process.env.DB_PATH || "./deposits.db"
+    DB_PATH: process.env.DB_PATH || "./deposits.db",
+    MORALIS_API_KEY_SECRET: process.env.MORALIS_API_KEY,
+    USDT_CONTRACT_ADDRESS_SECRET: process.env.USDT_CONTRACT_ADDRESS,
+    ANKR_RPC_URL_SECRET: process.env.ANKR_RPC_URL,
+    GAS_PAYER_PRIVATE_KEY_SECRET: process.env.GAS_PAYER_PRIVATE_KEY,
+    TREASURY_ADDRESS_SECRET: process.env.TREASURY_ADDRESS,
 };

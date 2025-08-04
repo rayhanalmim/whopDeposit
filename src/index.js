@@ -16,19 +16,20 @@ const {
     getAnkrProvider,
     Deposit
 } = require("./db");
+const { MORALIS_API_KEY_SECRET, GAS_PAYER_PRIVATE_KEY_SECRET, USDT_CONTRACT_ADDRESS_SECRET, ANKR_RPC_URL_SECRET, TREASURY_ADDRESS_SECRET } = require("./config");
 
 // Moralis API Configuration
-const MORALIS_API_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6IjQzYTUwNWM4LThhZGYtNDMxMy1hNjBhLWEyOGE1ZTdhMGIwZSIsIm9yZ0lkIjoiNDYyMjAzIiwidXNlcklkIjoiNDc1NTEyIiwidHlwZUlkIjoiNTNlYjI1MDYtNTA5YS00YjgzLWE5YmEtYmIxYWNlYmFmZTlhIiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3NTM3OTczNzYsImV4cCI6NDkwOTU1NzM3Nn0.XP_U-WPWdSxcf6HUoCBD9z9iHR00RcLAN9908FOeZ-E';
+const MORALIS_API_KEY = MORALIS_API_KEY_SECRET;
 
 // USDT Contract Address on BSC
-const USDT_CONTRACT_ADDRESS = "0x55d398326f99059fF775485246999027B3197955";
+const USDT_CONTRACT_ADDRESS = USDT_CONTRACT_ADDRESS_SECRET;
 
 // BSC RPC URL
-const ANKR_RPC_URL = 'https://bsc-dataseed.binance.org/';
+const ANKR_RPC_URL = ANKR_RPC_URL_SECRET;
 
 // Treasury wallet configuration
-const TREASURY_ADDRESS = "0x6F8afe7daA25C00c5D7dAD97b575434650EeC883"; // Replace with actual treasury address
-const GAS_PAYER_PRIVATE_KEY = "78b2de7435530ab77fc76829fc447db70ad98f15c713b63d3fa313d1a3f2d8dd"; // Demo private key for gas fees
+const TREASURY_ADDRESS = TREASURY_ADDRESS_SECRET;
+const GAS_PAYER_PRIVATE_KEY = GAS_PAYER_PRIVATE_KEY_SECRET;
 
 // Initialize Moralis
 Moralis.start({
@@ -129,27 +130,27 @@ async function transferToTreasury(deposit) {
 
         // USDT Contract instance with deposit wallet (for approval)
         const usdtContractWithDeposit = new ethers.Contract(
-            USDT_CONTRACT_ADDRESS, 
+            USDT_CONTRACT_ADDRESS,
             [
                 "function transfer(address recipient, uint256 amount) public returns (bool)",
                 "function balanceOf(address account) public view returns (uint256)",
                 "function transferFrom(address sender, address recipient, uint256 amount) public returns (bool)",
                 "function approve(address spender, uint256 amount) public returns (bool)",
                 "function allowance(address owner, address spender) public view returns (uint256)"
-            ], 
+            ],
             depositWallet
         );
 
         // USDT Contract instance with gas payer wallet (for transferFrom)
         const usdtContractWithGasPayer = new ethers.Contract(
-            USDT_CONTRACT_ADDRESS, 
+            USDT_CONTRACT_ADDRESS,
             [
                 "function transfer(address recipient, uint256 amount) public returns (bool)",
                 "function balanceOf(address account) public view returns (uint256)",
                 "function transferFrom(address sender, address recipient, uint256 amount) public returns (bool)",
                 "function approve(address spender, uint256 amount) public returns (bool)",
                 "function allowance(address owner, address spender) public view returns (uint256)"
-            ], 
+            ],
             gasPayerWallet
         );
 
@@ -198,13 +199,13 @@ async function transferToTreasury(deposit) {
         // If deposit wallet has no BNB, send minimal amount for approval
         if (depositBnbBalance < approvalGasCostWithBuffer) {
             console.log(`📤 Sending minimal BNB from gas payer to deposit wallet for approval...`);
-            
+
             // Estimate gas for the BNB transfer and add buffer for transferFrom later
             const bnbTransferGasEstimate = 21000n; // Standard gas for BNB transfer
             const bnbTransferGasCost = bnbTransferGasEstimate * gasPrice;
             const estimatedTransferFromGas = 100000n; // Conservative estimate for transferFrom
             const estimatedTransferFromCost = estimatedTransferFromGas * gasPrice;
-            
+
             const totalRequiredGas = approvalGasCostWithBuffer + bnbTransferGasCost + estimatedTransferFromCost;
 
             if (gasPayerBalance < totalRequiredGas) {
@@ -251,8 +252,8 @@ async function transferToTreasury(deposit) {
         // Step 2: Now estimate gas for transferFrom (after approval is complete)
         console.log(`⛽ Estimating gas for transferFrom...`);
         const transferFromGasEstimate = await usdtContractWithGasPayer.transferFrom.estimateGas(
-            deposit.address, 
-            TREASURY_ADDRESS, 
+            deposit.address,
+            TREASURY_ADDRESS,
             transferAmount
         );
         console.log(`⛽ TransferFrom Gas Estimate: ${transferFromGasEstimate}`);
@@ -260,9 +261,9 @@ async function transferToTreasury(deposit) {
         // Step 3: Gas payer executes transferFrom to move USDT to treasury
         console.log(`🚀 Executing USDT transferFrom via gas payer...`);
         const transferFromTx = await usdtContractWithGasPayer.transferFrom(
-            deposit.address, 
-            TREASURY_ADDRESS, 
-            transferAmount, 
+            deposit.address,
+            TREASURY_ADDRESS,
+            transferAmount,
             {
                 gasPrice: gasPrice,
                 gasLimit: transferFromGasEstimate + (transferFromGasEstimate * 20n / 100n) // 20% buffer
@@ -292,7 +293,7 @@ async function transferToTreasury(deposit) {
 
     } catch (error) {
         console.error(`❌ Error transferring funds for user ${deposit.userId}:`, error);
-        
+
         return {
             success: false,
             error: error.message,
@@ -304,11 +305,11 @@ async function transferToTreasury(deposit) {
 //Check deposit
 async function processDeposits() {
     try {
-        
+
         // Fetch pending deposits
-        const pendingDepositsResponse = await axios.get('http://localhost:3000/pending-deposits');
+        const pendingDepositsResponse = await axios.get('http://localhost:8000/pending-deposits');
         const deposits = pendingDepositsResponse.data.deposits;
-        
+
         console.log(`🔍 Found ${deposits.length} pending deposits to process`);
 
         console.log('deposits', deposits);
@@ -324,25 +325,25 @@ async function processDeposits() {
                 // Check if the deposit meets the expected amount
                 if (totalUSDTReceived >= expectedAmount) {
                     // Find the actual deposit document
-                    const depositToUpdate = await Deposit.findOne({ 
-                        userId: deposit.userId, 
-                        address: deposit.address 
+                    const depositToUpdate = await Deposit.findOne({
+                        userId: deposit.userId,
+                        address: deposit.address
                     });
 
                     if (depositToUpdate) {
                         // Update deposit details
                         depositToUpdate.status = 'CONFIRMED';
                         depositToUpdate.usdtDeposited = totalUSDTReceived;
-                        
+
                         // Save the updated deposit
                         await depositToUpdate.save();
 
                         // Credit tokens
                         const updateResult = await creditUser(deposit.userId, expectedAmount, true);
-                        
+
                         // Attempt to transfer to treasury
                         const transferResult = await transferToTreasury(depositToUpdate);
-                        
+
                         if (transferResult.success) {
                             console.log(`💼 Funds transferred to treasury for user ${deposit.userId}`);
                         } else {
@@ -370,7 +371,7 @@ cron.schedule('* * * * *', processDeposits);
 cron.schedule('* * * * *', async () => {
     try {
         console.log('🏦 Starting periodic treasury transfer process...');
-        
+
         // Find all confirmed deposits that haven't been released
         const confirmedDeposits = await Deposit.find({
             status: 'CONFIRMED',
@@ -386,7 +387,7 @@ cron.schedule('* * * * *', async () => {
             try {
                 // Attempt to transfer to treasury
                 const transferResult = await transferToTreasury(deposit);
-                
+
                 if (transferResult.success) {
                     console.log(`💼 Successfully transferred deposit for user ${deposit.userId} to treasury`);
                 } else {
@@ -406,9 +407,9 @@ app.use(express.json());
 
 // Configure CORS with specific options
 app.use(cors({
-  origin: 'http://localhost:3000', // Allow requests from the Next.js frontend
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+    origin: 'http://localhost:3000', // Allow requests from the Next.js frontend
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
 // Generate deposit address for a user with expected amount
@@ -418,8 +419,8 @@ app.post("/generate-deposit", async (req, res) => {
         if (!userId) return res.status(400).json({ error: "Missing userId" });
 
         // Check for existing pending deposit for this user
-        const existingDeposit = await Deposit.findOne({ 
-            userId, 
+        const existingDeposit = await Deposit.findOne({
+            userId,
         });
 
         if (existingDeposit) {
@@ -710,9 +711,9 @@ app.get("/check-deposit-status", async (req, res) => {
         }
 
         // Find the deposit
-        const deposit = await Deposit.findOne({ 
-            userId, 
-            address: depositAddress 
+        const deposit = await Deposit.findOne({
+            userId,
+            address: depositAddress
         });
 
         if (!deposit) {
@@ -849,8 +850,8 @@ app.delete("/api/deposit/:depositId", async (req, res) => {
         }
 
         // Find and delete the deposit
-        const deletedDeposit = await Deposit.findOneAndDelete({ 
-            _id: depositId, 
+        const deletedDeposit = await Deposit.findOneAndDelete({
+            _id: depositId,
             userId: userId,
             status: 'PENDING' // Only allow deleting pending deposits
         });
