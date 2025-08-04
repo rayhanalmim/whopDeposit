@@ -407,7 +407,7 @@ app.use(express.json());
 
 // Configure CORS with specific options
 app.use(cors({
-    origin: 'http://localhost:3000', // Allow requests from the Next.js frontend
+    origin: '*', // Allow requests from any origin
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization']
 }));
