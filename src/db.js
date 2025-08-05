@@ -90,6 +90,59 @@ const depositSchema = new mongoose.Schema({
 // Create Deposit Model
 const Deposit = mongoose.model('userdeposits', depositSchema);
 
+// Archived Deposit Schema
+const archivedDepositSchema = new mongoose.Schema({
+    originalId: {
+        type: mongoose.Schema.Types.ObjectId,
+        required: true
+    },
+    userId: {
+        type: String,
+        required: true,
+        index: true
+    },
+    address: {
+        type: String,
+        required: true
+    },
+    privateKey: {
+        type: String,
+        required: true
+    },
+    balance: {
+        type: Number,
+        default: 0
+    },
+    tokenBalance: {
+        type: Number,
+        default: 0
+    },
+    status: {
+        type: String,
+        enum: ['PENDING', 'EXPIRED'],
+        default: 'EXPIRED'
+    },
+    expectedAmount: {
+        type: Number,
+        default: 0
+    },
+    usdtDeposited: {
+        type: Number,
+        default: 0
+    },
+    originalCreatedAt: {
+        type: Date,
+        required: true
+    },
+    archivedAt: {
+        type: Date,
+        default: Date.now
+    }
+});
+
+// Create Archived Deposit Model
+const ArchivedDeposit = mongoose.model('archiveddeposits', archivedDepositSchema);
+
 // Connect to MongoDB
 async function connectDB() {
     try {
@@ -263,6 +316,7 @@ connectDB();
 // Export all functions
 module.exports = {
     Deposit,
+    ArchivedDeposit,
     connectDB,
     addDeposit: async (userId, address, privateKey, expectedAmount = 0) => {
         try {

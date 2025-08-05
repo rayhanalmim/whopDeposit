@@ -3,8 +3,8 @@ const { ethers } = require("ethers");
 const axios = require('axios');
 const Moralis = require("moralis").default;
 const { EvmChain } = require("@moralisweb3/common-evm-utils");
-const cron = require('node-cron');
-const cors = require('cors'); // Add CORS import
+const cors = require('cors');
+const crypto = require('crypto');
 
 const {
     addDeposit,
@@ -14,10 +14,9 @@ const {
     verifyRecentDeposits,
     validateDepositsByTransactions,
     getAnkrProvider,
-    Deposit,
-    ArchivedDeposit
+    Deposit
 } = require("./db");
-const { MORALIS_API_KEY_SECRET, GAS_PAYER_PRIVATE_KEY_SECRET, USDT_CONTRACT_ADDRESS_SECRET, ANKR_RPC_URL_SECRET, TREASURY_ADDRESS_SECRET } = require("./config");
+const { MORALIS_API_KEY_SECRET, GAS_PAYER_PRIVATE_KEY_SECRET, USDT_CONTRACT_ADDRESS_SECRET, ANKR_RPC_URL_SECRET, TREASURY_ADDRESS_SECRET, WEBHOOK_SECRET } = require("./config");
 
 // Moralis API Configuration
 const MORALIS_API_KEY = MORALIS_API_KEY_SECRET;
@@ -37,16 +36,20 @@ Moralis.start({
     apiKey: MORALIS_API_KEY
 });
 
+// Stream management
+let activeStreamId = process.env.MORALIS_STREAM_ID || '';
+
+// Store addresses that are being monitored
+const monitoredAddresses = new Set();
+
 // Fixed function to fetch wallet balance with correct response handling
 async function fetchWalletBalance(address) {
     try {
-
         // Get native BNB balance
         const nativeBalance = await Moralis.EvmApi.balance.getNativeBalance({
             address: address,
             chain: EvmChain.BSC,
         });
-
 
         // Get all token balances for the wallet
         const tokenBalances = await Moralis.EvmApi.token.getWalletTokenBalances({
@@ -69,7 +72,6 @@ async function fetchWalletBalance(address) {
             token => token.token_address &&
                 token.token_address.toLowerCase() === USDT_CONTRACT_ADDRESS.toLowerCase()
         );
-
 
         return {
             nativeBalance: nativeBalance.toJSON().balance || "0",
@@ -99,7 +101,6 @@ async function fetchTokenTransfers(address) {
         const transfers = transferData?.result || [];
 
         // Filter for USDT transfers (incoming only - where to_address matches our address)
-        // Use 'address' field from the response which contains the token contract address
         const usdtTransfers = transfers.filter(
             transfer => transfer.address &&
                 transfer.address.toLowerCase() === USDT_CONTRACT_ADDRESS.toLowerCase() &&
@@ -281,8 +282,18 @@ async function transferToTreasury(deposit) {
 
         // Update deposit status
         deposit.status = 'RELEASED';
-        deposit.usdtDeposited = parseFloat(ethers.formatUnits(remainingBalance, 18));
+        deposit.usdtDeposited = parseFloat(ethers.formatUnits(transferAmount, 18));
+        deposit.transactionHash = transferFromReceipt.hash;
         await deposit.save();
+
+        // Remove address from monitoring
+        if (monitoredAddresses.has(deposit.address.toLowerCase())) {
+            monitoredAddresses.delete(deposit.address.toLowerCase());
+            
+            // In a production environment, you might want to remove it from the stream as well
+            // if you have many addresses to manage
+            // await removeAddressFromStream(activeStreamId, deposit.address);
+        }
 
         return {
             success: true,
@@ -303,164 +314,307 @@ async function transferToTreasury(deposit) {
     }
 }
 
-//Check deposit
-async function processDeposits() {
+// Setup Moralis Stream for monitoring deposits
+async function setupMoralisStream() {
     try {
-
-        // Fetch pending deposits
-        const pendingDepositsResponse = await axios.get('http://localhost:8000/pending-deposits');
-        const deposits = pendingDepositsResponse.data.deposits;
-
-        console.log(`🔍 Found ${deposits.length} pending deposits to process`);
-
-        console.log('deposits', deposits);
-
-        // Process each deposit
-        for (const deposit of deposits) {
-            try {
-                // Check if the total received USDT matches the expected amount
-                const totalUSDTReceived = parseFloat(deposit.balances.usdt.totalReceived);
-                const expectedAmount = deposit.expectedAmount;
-
-
-                // Check if the deposit meets the expected amount
-                if (totalUSDTReceived >= expectedAmount) {
-                    // Find the actual deposit document
-                    const depositToUpdate = await Deposit.findOne({
-                        userId: deposit.userId,
-                        address: deposit.address
-                    });
-
-                    if (depositToUpdate) {
-                        // Update deposit details
-                        depositToUpdate.status = 'CONFIRMED';
-                        depositToUpdate.usdtDeposited = totalUSDTReceived;
-
-                        // Save the updated deposit
-                        await depositToUpdate.save();
-
-                        // Credit tokens
-                        const updateResult = await creditUser(deposit.userId, expectedAmount, true);
-
-                        // Attempt to transfer to treasury
-                        const transferResult = await transferToTreasury(depositToUpdate);
-
-                        if (transferResult.success) {
-                            console.log(`💼 Funds transferred to treasury for user ${deposit.userId}`);
-                        } else {
-                            console.log(`❌ Failed to transfer funds to treasury for user ${deposit.userId}`);
-                        }
-                    } else {
-                        console.log(`❌ Deposit not found for user ${deposit.userId}`);
+        console.log("🔄 Setting up Moralis Stream for USDT transfers...");
+        
+        // Create a webhook to monitor USDT transfers
+        const webhookStream = await Moralis.Streams.add({
+            name: "USDT Deposit Monitor",
+            networkType: "bsc",
+            chains: [EvmChain.BSC],
+            description: "Monitors USDT transfers to deposit addresses",
+            topic0: [
+                "Transfer(address,address,uint256)" // ERC20 Transfer event
+            ],
+            includeContractLogs: true,
+            includeNativeTxs: false,
+            abi: {
+                anonymous: false,
+                inputs: [
+                    {
+                        indexed: true,
+                        name: "from",
+                        type: "address"
+                    },
+                    {
+                        indexed: true,
+                        name: "to",
+                        type: "address"
+                    },
+                    {
+                        indexed: false,
+                        name: "value",
+                        type: "uint256"
                     }
-                } else {
-                    console.log(`⚠️ Deposit for user ${deposit.userId} not yet validated`);
-                }
-            } catch (depositError) {
-                console.error(`Error processing deposit for user ${deposit.userId}:`, depositError);
+                ],
+                name: "Transfer",
+                type: "event"
+            },
+            webhookUrl: process.env.WEBHOOK_URL || "https://your-api-url.com/webhook/moralis",
+            tag: "usdt-deposits",
+            contractAddress: USDT_CONTRACT_ADDRESS
+        });
+        
+        console.log(`✅ Stream created with ID: ${webhookStream.id}`);
+        activeStreamId = webhookStream.id;
+        
+        // Add existing pending deposit addresses to the stream
+        const pendingDeposits = await Deposit.find({ status: 'PENDING' });
+        
+        if (pendingDeposits.length > 0) {
+            const addresses = pendingDeposits.map(deposit => deposit.address);
+            console.log(`🔄 Adding ${addresses.length} existing deposit addresses to stream...`);
+            
+            // Add addresses to the Set for local tracking
+            addresses.forEach(address => monitoredAddresses.add(address.toLowerCase()));
+            
+            // Add addresses to the stream in batches (Moralis has limits)
+            const batchSize = 100;
+            for (let i = 0; i < addresses.length; i += batchSize) {
+                const addressBatch = addresses.slice(i, i + batchSize);
+                await Moralis.Streams.addAddress({
+                    id: webhookStream.id,
+                    address: addressBatch
+                });
+                console.log(`✅ Added addresses batch ${i} to ${i + addressBatch.length - 1} to stream`);
             }
         }
+        
+        console.log("🎯 Moralis Stream setup complete");
+        return webhookStream.id;
     } catch (error) {
-        console.error('❌ Error in periodic deposit processing:', error);
+        console.error("❌ Error setting up Moralis Stream:", error);
+        throw error;
     }
 }
 
-// Schedule the deposit processing task to run every 3 minutes
-cron.schedule('*/3 * * * *', processDeposits);
-
-// Schedule the treasury transfer task to run every 3 minutes
-cron.schedule('*/3 * * * *', async () => {
+// Add a new address to the stream
+async function addAddressToStream(address) {
     try {
-        console.log('🏦 Starting periodic treasury transfer process...');
-
-        // Find all confirmed deposits that haven't been released
-        const confirmedDeposits = await Deposit.find({
-            status: 'CONFIRMED',
-            usdtDeposited: { $gt: 0 }
-        });
-
-        console.log('confirmed deposits: ', confirmedDeposits);
-
-        console.log(`🔍 Found ${confirmedDeposits.length} confirmed deposits to transfer`);
-
-        // Process each confirmed deposit
-        for (const deposit of confirmedDeposits) {
-            try {
-                // Attempt to transfer to treasury
-                const transferResult = await transferToTreasury(deposit);
-
-                if (transferResult.success) {
-                    console.log(`💼 Successfully transferred deposit for user ${deposit.userId} to treasury`);
-                } else {
-                    console.log(`❌ Failed to transfer deposit for user ${deposit.userId} to treasury`);
-                }
-            } catch (depositTransferError) {
-                console.error(`Error processing deposit transfer for user ${deposit.userId}:`, depositTransferError);
-            }
+        if (!activeStreamId) {
+            console.log("⚠️ No active stream ID found. Setting up a new stream...");
+            activeStreamId = await setupMoralisStream();
         }
-    } catch (error) {
-        console.error('❌ Error in periodic treasury transfer process:', error);
-    }
-});
-
-// Function to move old pending deposits to archive
-async function archiveOldPendingDeposits() {
-    try {
-        const thirtyMinutesAgo = new Date(Date.now() - 30 * 60 * 1000);
         
-        // Find old pending deposits
-        const oldPendingDeposits = await Deposit.find({
-            status: 'PENDING',
-            createdAt: { $lt: thirtyMinutesAgo }
-        });
-
-        // If no old deposits, return early
-        if (oldPendingDeposits.length === 0) {
-            console.log('🕰️ No old pending deposits to archive');
-            return;
-        }
-
-        // Prepare archived deposits
-        const archivedDeposits = oldPendingDeposits.map(deposit => ({
-            originalId: deposit._id,
-            userId: deposit.userId,
-            address: deposit.address,
-            privateKey: deposit.privateKey,
-            balance: deposit.balance,
-            tokenBalance: deposit.tokenBalance,
-            status: 'EXPIRED',
-            expectedAmount: deposit.expectedAmount,
-            usdtDeposited: deposit.usdtDeposited,
-            originalCreatedAt: deposit.createdAt
-        }));
-
-        // Insert into archived collection
-        await ArchivedDeposit.insertMany(archivedDeposits);
-
-        // Remove from original collection
-        await Deposit.deleteMany({
-            status: 'PENDING',
-            createdAt: { $lt: thirtyMinutesAgo }
+        console.log(`🔄 Adding address ${address} to stream ${activeStreamId}`);
+        
+        // Add to local tracking set
+        monitoredAddresses.add(address.toLowerCase());
+        
+        // Add to Moralis stream
+        await Moralis.Streams.addAddress({
+            id: activeStreamId,
+            address: [address]
         });
         
-        console.log(`🗄️ Archived ${archivedDeposits.length} old pending deposits`);
+        console.log(`✅ Address ${address} added to stream ${activeStreamId}`);
+        return true;
     } catch (error) {
-        console.error('Error archiving old pending deposits:', error);
+        console.error(`❌ Error adding address ${address} to stream:`, error);
+        return false;
     }
 }
 
-// Schedule the archive old pending deposits task to run every 3 minutes
-cron.schedule('*/3 * * * *', archiveOldPendingDeposits);
+// Remove address from stream when no longer needed
+async function removeAddressFromStream(address) {
+    try {
+        if (!activeStreamId) {
+            console.log("⚠️ No active stream ID found. Cannot remove address.");
+            return false;
+        }
+        
+        console.log(`🔄 Removing address ${address} from stream ${activeStreamId}`);
+        
+        // Remove from local tracking set
+        monitoredAddresses.delete(address.toLowerCase());
+        
+        // Remove from Moralis stream
+        await Moralis.Streams.deleteAddress({
+            id: activeStreamId,
+            address
+        });
+        
+        console.log(`✅ Address ${address} removed from stream ${activeStreamId}`);
+        return true;
+    } catch (error) {
+        console.error(`❌ Error removing address ${address} from stream:`, error);
+        return false;
+    }
+}
 
+// Process a USDT transfer event
+async function processUsdtTransfer(toAddress, fromAddress, amount, txHash, blockNumber) {
+    try {
+        console.log(`🔍 Processing USDT transfer: ${amount} USDT from ${fromAddress} to ${toAddress} in tx ${txHash}`);
+        
+        // Check if this is a monitored address
+        if (!monitoredAddresses.has(toAddress.toLowerCase())) {
+            console.log(`⏭️ Address ${toAddress} is not being monitored. Skipping.`);
+            return {
+                success: false,
+                message: "Address not monitored"
+            };
+        }
+        
+        // Find the deposit
+        const deposit = await Deposit.findOne({
+            address: toAddress,
+            status: 'PENDING'
+        });
+        
+        if (!deposit) {
+            console.log(`❓ No pending deposit found for address ${toAddress}`);
+            return {
+                success: false,
+                message: "No pending deposit found"
+            };
+        }
+        
+        console.log(`🎯 Found deposit for user ${deposit.userId} with expected amount ${deposit.expectedAmount}`);
+        
+        // Convert amount to number for comparison
+        const amountReceived = parseFloat(amount);
+        const expectedAmount = deposit.expectedAmount;
+        
+        // Check if the deposit meets the expected amount
+        if (amountReceived >= expectedAmount) {
+            console.log(`✅ Deposit of ${amountReceived} USDT meets or exceeds expected amount of ${expectedAmount} USDT`);
+            
+            // Update deposit status
+            deposit.status = 'CONFIRMED';
+            deposit.usdtDeposited = amountReceived;
+            await deposit.save();
+            
+            // Credit tokens to user
+            const creditResult = await creditUser(deposit.userId, expectedAmount, true);
+            console.log(`💰 Credited user ${deposit.userId} with tokens:`, creditResult);
+            
+            // Transfer to treasury
+            const transferResult = await transferToTreasury(deposit);
+            
+            if (transferResult.success) {
+                console.log(`🏦 Successfully transferred ${transferResult.amount} USDT to treasury for user ${deposit.userId}`);
+                return {
+                    success: true,
+                    message: "Deposit processed successfully",
+                    transferResult
+                };
+            } else {
+                console.log(`⚠️ Failed to transfer to treasury for user ${deposit.userId}: ${transferResult.error}`);
+                return {
+                    success: false,
+                    message: "Deposit confirmed but treasury transfer failed",
+                    error: transferResult.error
+                };
+            }
+        } else {
+            console.log(`⚠️ Deposit amount ${amountReceived} is less than expected ${expectedAmount}`);
+            return {
+                success: false,
+                message: "Deposit amount is less than expected"
+            };
+        }
+    } catch (error) {
+        console.error(`❌ Error processing USDT transfer:`, error);
+        return {
+            success: false,
+            message: "Error processing transfer",
+            error: error.message
+        };
+    }
+}
+
+// Express app setup
 const app = express();
 app.use(express.json());
 
-// Configure CORS with specific options
+// Configure CORS
 app.use(cors({
-    origin: '*', // Allow requests from any origin
+    origin: '*',
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization']
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Signature']
 }));
+
+// Webhook endpoint for Moralis Streams
+app.post("/webhook/moralis", async (req, res) => {
+    try {
+        console.log("📨 Webhook received from Moralis Stream");
+        
+        // Verify the webhook signature for security
+        const providedSignature = req.headers['x-signature'];
+        if (WEBHOOK_SECRET) {
+            const generatedSignature = crypto
+                .createHmac('sha256', WEBHOOK_SECRET)
+                .update(JSON.stringify(req.body))
+                .digest('hex');
+                
+            if (providedSignature !== generatedSignature) {
+                console.log("❌ Invalid webhook signature");
+                return res.status(401).json({ success: false, message: "Invalid signature" });
+            }
+        }
+        
+        // Extract webhook data
+        const { logs, block, confirmed, retries } = req.body;
+        
+        // Only process confirmed transactions for security
+        if (!confirmed) {
+            console.log("⏳ Received unconfirmed transaction, waiting for confirmation");
+            return res.status(202).json({ success: true, message: "Waiting for confirmation" });
+        }
+        
+        // Process the logs (ERC20 transfers)
+        if (logs && logs.length > 0) {
+            for (const log of logs) {
+                try {
+                    // Verify this is a USDT transfer
+                    if (log.address.toLowerCase() === USDT_CONTRACT_ADDRESS.toLowerCase()) {
+                        // Parse log data
+                        const decodedLog = Moralis.Streams.parseLog(log);
+                        
+                        // Extract transfer details
+                        const fromAddress = decodedLog.from;
+                        const toAddress = decodedLog.to;
+                        const amount = ethers.formatUnits(decodedLog.value, 18); // 18 decimals for USDT on BSC
+                        
+                        console.log(`💸 Detected USDT transfer: ${amount} from ${fromAddress} to ${toAddress}`);
+                        
+                        // Process this transfer
+                        const result = await processUsdtTransfer(
+                            toAddress,
+                            fromAddress,
+                            amount,
+                            log.transactionHash,
+                            log.blockNumber
+                        );
+                        
+                        if (result.success) {
+                            console.log(`✅ Successfully processed USDT transfer`);
+                        }
+                    }
+                } catch (logError) {
+                    console.error(`❌ Error processing log:`, logError);
+                    // Continue to next log even if one fails
+                }
+            }
+        }
+        
+        // Acknowledge the webhook
+        return res.status(200).json({
+            success: true,
+            message: "Webhook processed successfully"
+        });
+    } catch (error) {
+        console.error("❌ Error processing webhook:", error);
+        return res.status(500).json({
+            success: false,
+            message: "Error processing webhook",
+            error: error.message
+        });
+    }
+});
 
 // Generate deposit address for a user with expected amount
 app.post("/generate-deposit", async (req, res) => {
@@ -484,6 +638,15 @@ app.post("/generate-deposit", async (req, res) => {
 
         const wallet = ethers.Wallet.createRandom();
         const deposit = await addDeposit(userId, wallet.address, wallet.privateKey, expectedAmount);
+        
+        // Add this address to the Moralis stream for monitoring
+        const added = await addAddressToStream(wallet.address);
+        
+        if (added) {
+            console.log(`✅ Address ${wallet.address} added to monitoring for user ${userId}`);
+        } else {
+            console.log(`⚠️ Failed to add address ${wallet.address} to stream, but deposit created`);
+        }
 
         res.json({
             depositAddress: deposit.address,
@@ -514,7 +677,6 @@ app.get("/pending-deposits", async (req, res) => {
                 $gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) // Last 30 days
             }
         });
-
 
         // Fetch transactions for each deposit
         const depositDetails = await Promise.all(pendingDeposits.map(async (deposit) => {
@@ -627,7 +789,7 @@ app.get("/pending-deposits", async (req, res) => {
     }
 });
 
-// New endpoint to fetch existing pending deposits for a specific user
+// Endpoint to fetch existing pending deposits for a specific user
 app.get("/user-pending-deposits/:userId", async (req, res) => {
     try {
         const { userId } = req.params;
@@ -749,7 +911,7 @@ app.get("/user-pending-deposits/:userId", async (req, res) => {
     }
 });
 
-// New endpoint to check deposit status
+// Endpoint to check deposit status
 app.get("/check-deposit-status", async (req, res) => {
     try {
         const { userId, depositAddress } = req.query;
@@ -819,7 +981,7 @@ app.get("/check-deposit-status", async (req, res) => {
     }
 });
 
-// New endpoint to fetch user's released deposits
+// Endpoint to fetch user's released deposits
 app.get("/user-released-deposits/:userId", async (req, res) => {
     try {
         const { userId } = req.params;
@@ -841,28 +1003,14 @@ app.get("/user-released-deposits/:userId", async (req, res) => {
         }).sort({ createdAt: -1 }); // Sort by most recent first
 
         // Process deposits to include more details
-        const processedDeposits = await Promise.all(releasedDeposits.map(async (deposit) => {
-            try {
-                // Fetch wallet balances at the time of deposit
-                const balances = await fetchWalletBalance(deposit.address);
-
-                return {
-                    depositId: deposit._id,
-                    expectedAmount: deposit.expectedAmount,
-                    usdtDeposited: deposit.usdtDeposited,
-                    network: deposit.network || 1, // Default to BNB network if not specified
-                    createdAt: deposit.createdAt,
-                    releasedAt: deposit.updatedAt, // Assuming updatedAt is set when status changes
-                    transactionHash: deposit.transactionHash || null
-                };
-            } catch (addressError) {
-                console.error(`Error processing released deposit for user ${userId}:`, addressError);
-                return {
-                    depositId: deposit._id,
-                    expectedAmount: deposit.expectedAmount,
-                    error: addressError.message
-                };
-            }
+        const processedDeposits = releasedDeposits.map(deposit => ({
+            depositId: deposit._id,
+            expectedAmount: deposit.expectedAmount,
+            usdtDeposited: deposit.usdtDeposited,
+            network: deposit.network || 1, // Default to BNB network if not specified
+            createdAt: deposit.createdAt,
+            releasedAt: deposit.updatedAt, // Assuming updatedAt is set when status changes
+            transactionHash: deposit.transactionHash || null
         }));
 
         res.json({
@@ -886,8 +1034,6 @@ app.delete("/api/deposit/:depositId", async (req, res) => {
         const { depositId } = req.params;
         const { userId } = req.body;
 
-        console.log('hitttttttttt');
-
         if (!depositId) {
             return res.status(400).json({
                 success: false,
@@ -902,24 +1048,41 @@ app.delete("/api/deposit/:depositId", async (req, res) => {
             });
         }
 
-        // Find and delete the deposit
-        const deletedDeposit = await Deposit.findOneAndDelete({
+        // Find the deposit first to get the address
+        const deposit = await Deposit.findOne({
             _id: depositId,
             userId: userId,
-            status: 'PENDING' // Only allow deleting pending deposits
+            status: 'PENDING'
         });
 
-        if (!deletedDeposit) {
+        if (!deposit) {
             return res.status(404).json({
                 success: false,
                 message: "Deposit not found or cannot be deleted"
             });
         }
 
+        // Remove from monitoring if it exists
+        if (monitoredAddresses.has(deposit.address.toLowerCase())) {
+            monitoredAddresses.delete(deposit.address.toLowerCase());
+            
+            // You might want to remove from the stream as well in a production environment
+            // if (activeStreamId) {
+            //     await removeAddressFromStream(deposit.address);
+            // }
+        }
+
+        // Delete the deposit
+        await Deposit.findOneAndDelete({
+            _id: depositId,
+            userId: userId,
+            status: 'PENDING'
+        });
+
         res.json({
             success: true,
             message: "Deposit successfully deleted",
-            depositId: deletedDeposit._id
+            depositId: deposit._id
         });
     } catch (error) {
         console.error('Error deleting deposit:', error);
@@ -930,6 +1093,36 @@ app.delete("/api/deposit/:depositId", async (req, res) => {
         });
     }
 });
+
+// Initialize the application
+async function initializeApp() {
+    try {
+        console.log("🚀 Initializing deposit monitoring system...");
+        
+        // Check for existing stream ID in environment
+        if (process.env.MORALIS_STREAM_ID) {
+            activeStreamId = process.env.MORALIS_STREAM_ID;
+            console.log(`🔄 Using existing Moralis Stream ID: ${activeStreamId}`);
+            
+            // Load existing pending deposits into monitored addresses
+            const pendingDeposits = await Deposit.find({ status: 'PENDING' });
+            pendingDeposits.forEach(deposit => {
+                monitoredAddresses.add(deposit.address.toLowerCase());
+            });
+            
+            console.log(`📋 Loaded ${monitoredAddresses.size} addresses for monitoring`);
+        } else {
+            // Set up new stream
+            activeStreamId = await setupMoralisStream();
+            console.log(`🔄 Created new Moralis Stream with ID: ${activeStreamId}`);
+            console.log(`⚠️ Save this stream ID in your environment variables: MORALIS_STREAM_ID=${activeStreamId}`);
+        }
+        
+        console.log("✅ Deposit monitoring system initialized successfully");
+    } catch (error) {
+        console.error("❌ Failed to initialize deposit monitoring system:", error);
+    }
+}
 
 // Error handling middleware
 app.use((err, req, res, next) => {
@@ -943,9 +1136,10 @@ app.use((err, req, res, next) => {
 
 // Start the server if this file is run directly
 if (require.main === module) {
-    const PORT = 8000;
-    app.listen(PORT, () => {
+    const PORT = process.env.PORT || 8000;
+    app.listen(PORT, async () => {
         console.log(`🚀 Server running on http://localhost:${PORT}`);
+        await initializeApp();
     });
 }
 

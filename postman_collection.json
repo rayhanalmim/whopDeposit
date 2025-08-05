@@ -1,0 +1,132 @@
+{
+    "info": {
+        "_postman_id": "a1b2c3d4-e5f6-7890-g1h2-i3j4k5l6m7n8",
+        "name": "Deposit Management API",
+        "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+    },
+    "item": [
+        {
+            "name": "Deposits",
+            "item": [
+                {
+                    "name": "Get Pending Deposits",
+                    "request": {
+                        "method": "GET",
+                        "header": [],
+                        "url": {
+                            "raw": "{{base_url}}/pending-deposits",
+                            "host": ["{{base_url}}"],
+                            "path": ["pending-deposits"]
+                        }
+                    },
+                    "response": []
+                },
+                {
+                    "name": "Check Deposit Status",
+                    "request": {
+                        "method": "GET",
+                        "header": [],
+                        "url": {
+                            "raw": "{{base_url}}/check-deposit-status?userId=user123&depositAddress=0x1234567890123456789012345678901234567890",
+                            "host": ["{{base_url}}"],
+                            "path": ["check-deposit-status"],
+                            "query": [
+                                {
+                                    "key": "userId",
+                                    "value": "user123"
+                                },
+                                {
+                                    "key": "depositAddress",
+                                    "value": "0x1234567890123456789012345678901234567890"
+                                }
+                            ]
+                        }
+                    },
+                    "response": []
+                },
+                {
+                    "name": "Get User Released Deposits",
+                    "request": {
+                        "method": "GET",
+                        "header": [],
+                        "url": {
+                            "raw": "{{base_url}}/user-released-deposits/user123",
+                            "host": ["{{base_url}}"],
+                            "path": ["user-released-deposits", "user123"]
+                        }
+                    },
+                    "response": []
+                },
+                {
+                    "name": "Verify Deposits",
+                    "request": {
+                        "method": "POST",
+                        "header": [
+                            {
+                                "key": "Content-Type",
+                                "value": "application/json"
+                            }
+                        ],
+                        "url": {
+                            "raw": "{{base_url}}/verify-deposits",
+                            "host": ["{{base_url}}"],
+                            "path": ["verify-deposits"]
+                        }
+                    },
+                    "response": []
+                },
+                {
+                    "name": "Delete Deposit",
+                    "request": {
+                        "method": "DELETE",
+                        "header": [
+                            {
+                                "key": "Content-Type",
+                                "value": "application/json"
+                            }
+                        ],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\"userId\":\"user123\"}"
+                        },
+                        "url": {
+                            "raw": "{{base_url}}/api/deposit/deposit_id_here",
+                            "host": ["{{base_url}}"],
+                            "path": ["api", "deposit", "deposit_id_here"]
+                        }
+                    },
+                    "response": []
+                },
+                {
+                    "name": "Generate Deposit",
+                    "request": {
+                        "method": "POST",
+                        "header": [
+                            {
+                                "key": "Content-Type",
+                                "value": "application/json"
+                            }
+                        ],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\"userId\":\"user123\",\"expectedAmount\":100}"
+                        },
+                        "url": {
+                            "raw": "{{base_url}}/generate-deposit",
+                            "host": ["{{base_url}}"],
+                            "path": ["generate-deposit"]
+                        }
+                    },
+                    "response": []
+                }
+            ]
+        }
+    ],
+    "variable": [
+        {
+            "key": "base_url",
+            "value": "http://localhost:3000",
+            "type": "string"
+        }
+    ]
+}
