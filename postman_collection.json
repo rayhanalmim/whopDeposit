@@ -58,24 +58,6 @@
                     "response": []
                 },
                 {
-                    "name": "Verify Deposits",
-                    "request": {
-                        "method": "POST",
-                        "header": [
-                            {
-                                "key": "Content-Type",
-                                "value": "application/json"
-                            }
-                        ],
-                        "url": {
-                            "raw": "{{base_url}}/verify-deposits",
-                            "host": ["{{base_url}}"],
-                            "path": ["verify-deposits"]
-                        }
-                    },
-                    "response": []
-                },
-                {
                     "name": "Delete Deposit",
                     "request": {
                         "method": "DELETE",
@@ -125,7 +107,7 @@
     "variable": [
         {
             "key": "base_url",
-            "value": "http://localhost:3000",
+            "value": "https://3.83.153.188",
             "type": "string"
         }
     ]

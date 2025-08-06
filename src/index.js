@@ -18,6 +18,7 @@ const {
     ArchivedDeposit
 } = require("./db");
 const { MORALIS_API_KEY_SECRET, GAS_PAYER_PRIVATE_KEY_SECRET, USDT_CONTRACT_ADDRESS_SECRET, ANKR_RPC_URL_SECRET, TREASURY_ADDRESS_SECRET } = require("./config");
+const { apiKeyAuth } = require("./middleware/auth");
 
 // Moralis API Configuration
 const MORALIS_API_KEY = MORALIS_API_KEY_SECRET;
@@ -407,7 +408,7 @@ cron.schedule('*/3 * * * *', async () => {
 async function archiveOldPendingDeposits() {
     try {
         const thirtyMinutesAgo = new Date(Date.now() - 30 * 60 * 1000);
-        
+
         // Find old pending deposits
         const oldPendingDeposits = await Deposit.find({
             status: 'PENDING',
@@ -442,7 +443,7 @@ async function archiveOldPendingDeposits() {
             status: 'PENDING',
             createdAt: { $lt: thirtyMinutesAgo }
         });
-        
+
         console.log(`🗄️ Archived ${archivedDeposits.length} old pending deposits`);
     } catch (error) {
         console.error('Error archiving old pending deposits:', error);
@@ -463,7 +464,7 @@ app.use(cors({
 }));
 
 // Generate deposit address for a user with expected amount
-app.post("/generate-deposit", async (req, res) => {
+app.post("/generate-deposit", apiKeyAuth, async (req, res) => {
     try {
         const { userId, expectedAmount } = req.body;
         if (!userId) return res.status(400).json({ error: "Missing userId" });
@@ -475,7 +476,7 @@ app.post("/generate-deposit", async (req, res) => {
         });
 
         if (existingDeposit) {
-            return res.status(400).json({
+            return res.status(202).json({
                 success: false,
                 message: "You already have an active deposit request. Please complete or cancel the existing deposit before creating a new one.",
                 existingDepositAddress: existingDeposit.address
@@ -485,15 +486,12 @@ app.post("/generate-deposit", async (req, res) => {
         const wallet = ethers.Wallet.createRandom();
         const deposit = await addDeposit(userId, wallet.address, wallet.privateKey, expectedAmount);
 
+        // Exclude privateKey from the new deposit object
+        const { privateKey, tokenBalance, ...sanitizedDeposit } = deposit.toObject();
+
         res.json({
-            depositAddress: deposit.address,
-            expectedAmount: deposit.expectedAmount || 0,
-            instructions: `
-                Send BNB to this address and USDT to the same address.
-                Minimum BNB deposit: 0.001 BNB
-                Expected USDT Amount: ${deposit.expectedAmount || 'Not specified'}
-                Maximum BNB deposit: 100 BNB
-            `
+            success: true,
+            deposit: sanitizedDeposit
         });
     } catch (error) {
         res.status(500).json({
@@ -651,7 +649,7 @@ app.get("/user-pending-deposits/:userId", async (req, res) => {
         // If no pending deposits found, return an empty array
         if (pendingDeposits.length === 0) {
             return res.json({
-                success: true,
+                pending: false,
                 message: "No pending deposits found for this user",
                 deposits: []
             });
@@ -736,6 +734,7 @@ app.get("/user-pending-deposits/:userId", async (req, res) => {
 
         res.json({
             success: true,
+            pending : true,
             message: `Found ${depositDetails.length} pending deposits for user ${userId}`,
             deposits: depositDetails
         });
@@ -761,17 +760,33 @@ app.get("/check-deposit-status", async (req, res) => {
             });
         }
 
-        // Find the deposit
-        const deposit = await Deposit.findOne({
+        // Find the deposit in main collection
+        let deposit = await Deposit.findOne({
             userId,
             address: depositAddress
         });
-
+        
+        // Set archive flag
+        let isArchived = false;
+        
+        // If deposit not found in main collection, check the archive
         if (!deposit) {
-            return res.status(404).json({
-                success: false,
-                message: "Deposit not found"
+            deposit = await ArchivedDeposit.findOne({
+                userId,
+                address: depositAddress,
+                status: "EXPIRED"
             });
+            
+            // If still not found, return 404
+            if (!deposit) {
+                return res.status(404).json({
+                    success: false,
+                    message: "Deposit not found"
+                });
+            }
+            
+            // Set archive flag to true if found in archive
+            isArchived = true;
         }
 
         // Fetch wallet balances
@@ -807,7 +822,8 @@ app.get("/check-deposit-status", async (req, res) => {
             expectedAmount: deposit.expectedAmount,
             usdtDeposited: totalUSDTReceived,
             transactions: processedTokenTxs,
-            isReleased: deposit.status === 'RELEASED'
+            isReleased: deposit.status === 'RELEASED',
+            archived: isArchived // Added archive flag to the response
         });
     } catch (error) {
         console.error('Error checking deposit status:', error);
@@ -820,7 +836,7 @@ app.get("/check-deposit-status", async (req, res) => {
 });
 
 // New endpoint to fetch user's released deposits
-app.get("/user-released-deposits/:userId", async (req, res) => {
+app.get("/user-released-deposits/:userId", apiKeyAuth, async (req, res) => {
     try {
         const { userId } = req.params;
 
@@ -881,10 +897,9 @@ app.get("/user-released-deposits/:userId", async (req, res) => {
 });
 
 // Delete a specific deposit
-app.delete("/api/deposit/:depositId", async (req, res) => {
+app.delete("/api/deposit/:depositId", apiKeyAuth, async (req, res) => {
     try {
         const { depositId } = req.params;
-        const { userId } = req.body;
 
         console.log('hitttttttttt');
 
@@ -895,17 +910,10 @@ app.delete("/api/deposit/:depositId", async (req, res) => {
             });
         }
 
-        if (!userId) {
-            return res.status(400).json({
-                success: false,
-                message: "User ID is required"
-            });
-        }
 
         // Find and delete the deposit
         const deletedDeposit = await Deposit.findOneAndDelete({
             _id: depositId,
-            userId: userId,
             status: 'PENDING' // Only allow deleting pending deposits
         });
 
