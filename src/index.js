@@ -463,7 +463,6 @@ app.use(cors({
     allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
-// Generate deposit address for a user with expected amount
 app.post("/generate-deposit", apiKeyAuth, async (req, res) => {
     try {
         const { userId, expectedAmount } = req.body;
@@ -475,11 +474,19 @@ app.post("/generate-deposit", apiKeyAuth, async (req, res) => {
             status: 'PENDING'
         });
 
-        if (existingDeposit) {
+        const existingReleasedDeposit = await Deposit.findOne({
+            userId,
+            status: 'RELEASED',
+            isTaken: false
+        });
+
+        console.log("both deposits", existingDeposit, existingReleasedDeposit);
+
+        if (existingDeposit || existingReleasedDeposit) {
             return res.status(202).json({
                 success: false,
                 message: "You already have an active deposit request. Please complete or cancel the existing deposit before creating a new one.",
-                existingDepositAddress: existingDeposit.address
+                existingDepositAddress: existingDeposit?.address || existingReleasedDeposit?.address
             });
         }
 
@@ -637,6 +644,7 @@ app.get("/user-pending-deposits/:userId", async (req, res) => {
             });
         }
 
+
         // Find pending deposits for the specific user
         const pendingDeposits = await Deposit.find({
             userId,
@@ -646,8 +654,18 @@ app.get("/user-pending-deposits/:userId", async (req, res) => {
             }
         });
 
+        // Find pending and released deposits for the specific user
+        const PendingReleasedDeposits = await Deposit.find({
+            userId,
+            status: 'RELEASED',
+            isTaken: false,
+            createdAt: {
+                $gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) // Last 30 days
+            }
+        });
+
         // If no pending deposits found, return an empty array
-        if (pendingDeposits.length === 0) {
+        if (pendingDeposits.length === 0 && PendingReleasedDeposits.length === 0) {
             return res.json({
                 pending: false,
                 message: "No pending deposits found for this user",
@@ -655,8 +673,12 @@ app.get("/user-pending-deposits/:userId", async (req, res) => {
             });
         }
 
+        const allDeposits = [...pendingDeposits, ...PendingReleasedDeposits];
+
+
+
         // Process each pending deposit to get more details
-        const depositDetails = await Promise.all(pendingDeposits.map(async (deposit) => {
+        const depositDetails = await Promise.all(allDeposits.map(async (deposit) => {
             try {
                 // Fetch wallet balances
                 const balances = await fetchWalletBalance(deposit.address);
@@ -734,7 +756,8 @@ app.get("/user-pending-deposits/:userId", async (req, res) => {
 
         res.json({
             success: true,
-            pending : true,
+            pending: pendingDeposits.length > 0 && PendingReleasedDeposits.length === 0,
+            pendingReleased: PendingReleasedDeposits.length > 0,
             message: `Found ${depositDetails.length} pending deposits for user ${userId}`,
             deposits: depositDetails
         });
@@ -743,6 +766,58 @@ app.get("/user-pending-deposits/:userId", async (req, res) => {
         res.status(500).json({
             success: false,
             message: "Error retrieving pending deposits",
+            error: error.message
+        });
+    }
+});
+
+app.post("/claim-deposit", apiKeyAuth, async (req, res) => {
+    try {
+        const { userId, address } = req.body;
+
+        if (!userId || !address) {
+            return res.status(400).json({
+                success: false,
+                message: "User ID and address are required"
+            });
+        }
+
+        // Find pending deposits for the specific user
+        const PendingReleasedDeposits = await Deposit.find({
+            userId,
+            address,
+            status: 'RELEASED',
+            isTaken: false,
+            createdAt: {
+                $gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) // Last 30 days
+            }
+        });
+
+        if (PendingReleasedDeposits.length === 0) {
+            return res.status(400).json({
+                success: false,
+                message: `no released deposits found for this user ${userId}`
+            });
+        }
+
+        const updatedDeposit = await Deposit.updateOne({
+            userId,
+            address,
+            isTaken: true
+        });
+
+        res.json({
+            success: true,
+            claimed: true,
+            message: `Deposit ${address} claimed for user ${userId}`,
+            updatedDeposit: updatedDeposit
+        });
+
+    } catch (error) {
+        console.error(`Error claiming deposit for user ${req.params.userId}:`, error);
+        res.status(500).json({
+            success: false,
+            message: "Error claiming deposit",
             error: error.message
         });
     }
@@ -760,15 +835,20 @@ app.get("/check-deposit-status", async (req, res) => {
             });
         }
 
+        console.log('both deposits', userId, depositAddress);
+
         // Find the deposit in main collection
         let deposit = await Deposit.findOne({
             userId,
             address: depositAddress
         });
-        
+
+        console.log(deposit);
+
+
         // Set archive flag
         let isArchived = false;
-        
+
         // If deposit not found in main collection, check the archive
         if (!deposit) {
             deposit = await ArchivedDeposit.findOne({
@@ -776,7 +856,7 @@ app.get("/check-deposit-status", async (req, res) => {
                 address: depositAddress,
                 status: "EXPIRED"
             });
-            
+
             // If still not found, return 404
             if (!deposit) {
                 return res.status(404).json({
@@ -784,13 +864,10 @@ app.get("/check-deposit-status", async (req, res) => {
                     message: "Deposit not found"
                 });
             }
-            
+
             // Set archive flag to true if found in archive
             isArchived = true;
         }
-
-        // Fetch wallet balances
-        const balances = await fetchWalletBalance(depositAddress);
 
         // Fetch token transfers
         const tokenTransfers = await fetchTokenTransfers(depositAddress);
@@ -816,12 +893,27 @@ app.get("/check-deposit-status", async (req, res) => {
             }
         }, 0);
 
+        const isReleased = await Deposit.findOne({
+            userId,
+            address: depositAddress,
+            status: "RELEASED"
+        });
+
+        if (isReleased) {
+            await Deposit.updateOne({
+                userId,
+                address: depositAddress
+            }, {
+                isTaken: true
+            });
+        }
+
         res.json({
             success: true,
             depositStatus: deposit.status,
             expectedAmount: deposit.expectedAmount,
-            usdtDeposited: totalUSDTReceived,
-            transactions: processedTokenTxs,
+            depositId: deposit._id,
+            depositAddress: deposit.address,
             isReleased: deposit.status === 'RELEASED',
             archived: isArchived // Added archive flag to the response
         });

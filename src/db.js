@@ -73,6 +73,10 @@ const depositSchema = new mongoose.Schema({
         enum: ['PENDING', 'CONFIRMED', 'RELEASED'],
         default: 'PENDING'
     },
+    isTaken: {
+        type: Boolean,
+        required: false
+    },
     expectedAmount: {
         type: Number,
         default: 0
@@ -108,6 +112,10 @@ const archivedDepositSchema = new mongoose.Schema({
     privateKey: {
         type: String,
         required: true
+    },
+    isTaken: {
+        type: Boolean,
+        required: false
     },
     balance: {
         type: Number,
@@ -324,7 +332,8 @@ module.exports = {
                 userId,
                 address,
                 privateKey,
-                expectedAmount: parseFloat(expectedAmount) || 0
+                isTaken : false,
+                expectedAmount: parseFloat(expectedAmount) || 0,
             });
             await deposit.save();
             console.log(`💾 Deposit created for user ${userId}`);
