@@ -73,6 +73,11 @@ const depositSchema = new mongoose.Schema({
         enum: ['PENDING', 'CONFIRMED', 'RELEASED'],
         default: 'PENDING'
     },
+    readyForValidate: {
+        type: Boolean,
+        required: false,
+        default : false
+    },
     isTaken: {
         type: Boolean,
         required: false

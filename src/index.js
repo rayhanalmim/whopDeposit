@@ -309,7 +309,66 @@ async function processDeposits() {
     try {
 
         // Fetch pending deposits
-        const pendingDepositsResponse = await axios.get('http://localhost:8000/pending-deposits');
+        const pendingDepositsResponse = await axios.get(`http://localhost:8000/pending-deposits?flag=${true}`);
+        const deposits = pendingDepositsResponse.data.deposits;
+
+        console.log(`🔍 Found ${deposits.length} pending deposits to process`);
+
+        console.log('deposits', deposits);
+
+        // Process each deposit
+        for (const deposit of deposits) {
+            try {
+                // Check if the total received USDT matches the expected amount
+                const totalUSDTReceived = parseFloat(deposit.balances.usdt.totalReceived);
+                const expectedAmount = deposit.expectedAmount;
+
+
+                // Check if the deposit meets the expected amount
+                if (totalUSDTReceived >= expectedAmount) {
+                    // Find the actual deposit document
+                    const depositToUpdate = await Deposit.findOne({
+                        userId: deposit.userId,
+                        address: deposit.address
+                    });
+
+                    if (depositToUpdate) {
+                        // Update deposit details
+                        depositToUpdate.status = 'CONFIRMED';
+                        depositToUpdate.usdtDeposited = totalUSDTReceived;
+
+                        // Save the updated deposit
+                        await depositToUpdate.save();
+
+                        // Credit tokens
+                        const updateResult = await creditUser(deposit.userId, expectedAmount, true);
+
+                        // Attempt to transfer to treasury
+                        const transferResult = await transferToTreasury(depositToUpdate);
+
+                        if (transferResult.success) {
+                            console.log(`💼 Funds transferred to treasury for user ${deposit.userId}`);
+                        } else {
+                            console.log(`❌ Failed to transfer funds to treasury for user ${deposit.userId}`);
+                        }
+                    } else {
+                        console.log(`❌ Deposit not found for user ${deposit.userId}`);
+                    }
+                } else {
+                    console.log(`⚠️ Deposit for user ${deposit.userId} not yet validated`);
+                }
+            } catch (depositError) {
+                console.error(`Error processing deposit for user ${deposit.userId}:`, depositError);
+            }
+        }
+    } catch (error) {
+        console.error('❌ Error in periodic deposit processing:', error);
+    }
+}
+async function processDepositsWithFlag() {
+    try {
+        // Fetch pending deposits
+        const pendingDepositsResponse = await axios.get(`http://localhost:8000/pending-deposits?flag=${false}`);
         const deposits = pendingDepositsResponse.data.deposits;
 
         console.log(`🔍 Found ${deposits.length} pending deposits to process`);
@@ -368,6 +427,9 @@ async function processDeposits() {
 
 // Schedule the deposit processing task to run every 3 minutes
 cron.schedule('*/3 * * * *', processDeposits);
+
+
+cron.schedule('*/20 * * * *', processDepositsWithFlag);
 
 // Schedule the treasury transfer task to run every 3 minutes
 cron.schedule('*/3 * * * *', async () => {
@@ -513,8 +575,10 @@ app.post("/generate-deposit", apiKeyAuth, async (req, res) => {
 app.get("/pending-deposits", async (req, res) => {
     try {
         // Find all pending deposits
+        const flag = req.query.flag;
         const pendingDeposits = await Deposit.find({
             status: 'PENDING',
+            readyForValidate : flag,
             createdAt: {
                 $gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) // Last 30 days
             }
@@ -771,57 +835,7 @@ app.get("/user-pending-deposits/:userId", async (req, res) => {
     }
 });
 
-app.post("/claim-deposit", apiKeyAuth, async (req, res) => {
-    try {
-        const { userId, address } = req.body;
 
-        if (!userId || !address) {
-            return res.status(400).json({
-                success: false,
-                message: "User ID and address are required"
-            });
-        }
-
-        // Find pending deposits for the specific user
-        const PendingReleasedDeposits = await Deposit.find({
-            userId,
-            address,
-            status: 'RELEASED',
-            isTaken: false,
-            createdAt: {
-                $gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) // Last 30 days
-            }
-        });
-
-        if (PendingReleasedDeposits.length === 0) {
-            return res.status(400).json({
-                success: false,
-                message: `no released deposits found for this user ${userId}`
-            });
-        }
-
-        const updatedDeposit = await Deposit.updateOne({
-            userId,
-            address,
-            isTaken: true
-        });
-
-        res.json({
-            success: true,
-            claimed: true,
-            message: `Deposit ${address} claimed for user ${userId}`,
-            updatedDeposit: updatedDeposit
-        });
-
-    } catch (error) {
-        console.error(`Error claiming deposit for user ${req.params.userId}:`, error);
-        res.status(500).json({
-            success: false,
-            message: "Error claiming deposit",
-            error: error.message
-        });
-    }
-});
 
 // New endpoint to check deposit status
 app.get("/check-deposit-status", async (req, res) => {
@@ -883,20 +897,18 @@ app.get("/check-deposit-status", async (req, res) => {
             timestamp: tx.block_timestamp
         }));
 
-        // Calculate total USDT received
-        const totalUSDTReceived = processedTokenTxs.reduce((total, tx) => {
-            try {
-                return total + parseFloat(tx.value);
-            } catch (formatError) {
-                console.error(`Error formatting token value:`, formatError);
-                return total;
-            }
-        }, 0);
 
         const isReleased = await Deposit.findOne({
             userId,
             address: depositAddress,
             status: "RELEASED"
+        });
+
+        await Deposit.updateOne({
+            userId,
+            address: depositAddress
+        }, {
+            readyForValidate: true
         });
 
         if (isReleased) {
