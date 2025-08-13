@@ -8,12 +8,7 @@ const cors = require('cors'); // Add CORS import
 
 const {
     addDeposit,
-    releaseTokens,
-    getDepositDetails,
     creditUser,
-    verifyRecentDeposits,
-    validateDepositsByTransactions,
-    getAnkrProvider,
     Deposit,
     ArchivedDeposit
 } = require("./db");
@@ -308,6 +303,8 @@ async function transferToTreasury(deposit) {
 async function processDeposits() {
     try {
 
+        console.log('cron 1 minute interval');
+
         // Fetch pending deposits
         const pendingDepositsResponse = await axios.get(`http://localhost:8000/pending-deposits?flag=${true}`);
         const deposits = pendingDepositsResponse.data.deposits;
@@ -319,6 +316,9 @@ async function processDeposits() {
         // Process each deposit
         for (const deposit of deposits) {
             try {
+                if(deposit.status == 'RELEASED'){
+                    continue;
+                }
                 // Check if the total received USDT matches the expected amount
                 const totalUSDTReceived = parseFloat(deposit.balances.usdt.totalReceived);
                 const expectedAmount = deposit.expectedAmount;
@@ -335,13 +335,14 @@ async function processDeposits() {
                     if (depositToUpdate) {
                         // Update deposit details
                         depositToUpdate.status = 'CONFIRMED';
+                        console.log('change status of the confirm processDeposits: ', deposit.expectedAmount);
                         depositToUpdate.usdtDeposited = totalUSDTReceived;
 
                         // Save the updated deposit
                         await depositToUpdate.save();
 
                         // Credit tokens
-                        const updateResult = await creditUser(deposit.userId, expectedAmount, true);
+                        // const updateResult = await creditUser(deposit.userId, expectedAmount, true);
 
                         // Attempt to transfer to treasury
                         const transferResult = await transferToTreasury(depositToUpdate);
@@ -367,6 +368,8 @@ async function processDeposits() {
 }
 async function processDepositsWithFlag() {
     try {
+
+        console.log('cron 5 minute interval');
         // Fetch pending deposits
         const pendingDepositsResponse = await axios.get(`http://localhost:8000/pending-deposits?flag=${false}`);
         const deposits = pendingDepositsResponse.data.deposits;
@@ -378,6 +381,9 @@ async function processDepositsWithFlag() {
         // Process each deposit
         for (const deposit of deposits) {
             try {
+                if(deposit.status == 'RELEASED'){
+                    continue;
+                }
                 // Check if the total received USDT matches the expected amount
                 const totalUSDTReceived = parseFloat(deposit.balances.usdt.totalReceived);
                 const expectedAmount = deposit.expectedAmount;
@@ -394,13 +400,14 @@ async function processDepositsWithFlag() {
                     if (depositToUpdate) {
                         // Update deposit details
                         depositToUpdate.status = 'CONFIRMED';
+                        console.log('change status of the confirm processDepositsWithFlag: ', deposit.expectedAmount);
                         depositToUpdate.usdtDeposited = totalUSDTReceived;
 
                         // Save the updated deposit
                         await depositToUpdate.save();
 
                         // Credit tokens
-                        const updateResult = await creditUser(deposit.userId, expectedAmount, true);
+                        // const updateResult = await creditUser(deposit.userId, expectedAmount, true);
 
                         // Attempt to transfer to treasury
                         const transferResult = await transferToTreasury(depositToUpdate);
@@ -426,10 +433,10 @@ async function processDepositsWithFlag() {
 }
 
 // Schedule the deposit processing task to run every 3 minutes
-cron.schedule('*/3 * * * *', processDeposits);
+cron.schedule('*/1 * * * *', processDeposits);
 
 
-cron.schedule('*/20 * * * *', processDepositsWithFlag);
+cron.schedule('*/5 * * * *', processDepositsWithFlag);
 
 // Schedule the treasury transfer task to run every 3 minutes
 cron.schedule('*/3 * * * *', async () => {
