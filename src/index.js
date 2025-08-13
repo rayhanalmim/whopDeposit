@@ -10,6 +10,7 @@ const {
     addDeposit,
     creditUser,
     Deposit,
+    ConfirmedDeposit,
     ArchivedDeposit
 } = require("./db");
 const { MORALIS_API_KEY_SECRET, GAS_PAYER_PRIVATE_KEY_SECRET, USDT_CONTRACT_ADDRESS_SECRET, ANKR_RPC_URL_SECRET, TREASURY_ADDRESS_SECRET } = require("./config");
@@ -277,7 +278,8 @@ async function transferToTreasury(deposit) {
 
         // Update deposit status
         deposit.status = 'RELEASED';
-        deposit.usdtDeposited = parseFloat(ethers.formatUnits(remainingBalance, 18));
+        deposit.usdtDeposited = parseFloat(ethers.formatUnits(transferAmount, 18));
+        deposit.transactionHash = transferFromReceipt.hash;
         await deposit.save();
 
         return {
@@ -290,6 +292,237 @@ async function transferToTreasury(deposit) {
 
     } catch (error) {
         console.error(`❌ Error transferring funds for user ${deposit.userId}:`, error);
+
+        return {
+            success: false,
+            error: error.message,
+            details: error.reason || error.code || 'Unknown error'
+        };
+    }
+}
+
+async function transferToUserRefundable(deposit) {
+    try {
+        console.log(`🏦 Initiating refund for deposit of user ${deposit.userId}`);
+        console.log(`Processing deposit for user ${deposit.userId}, address: ${deposit.address}`);
+
+        // Create provider
+        const provider = new ethers.JsonRpcProvider(ANKR_RPC_URL);
+
+        // Create wallet from deposit's private key
+        const depositWallet = new ethers.Wallet(deposit.privateKey, provider);
+
+        // Create gas payer wallet
+        const gasPayerWallet = new ethers.Wallet(GAS_PAYER_PRIVATE_KEY, provider);
+
+        // USDT Contract instance with deposit wallet (for approval)
+        const usdtContractWithDeposit = new ethers.Contract(
+            USDT_CONTRACT_ADDRESS,
+            [
+                "function transfer(address recipient, uint256 amount) public returns (bool)",
+                "function balanceOf(address account) public view returns (uint256)",
+                "function transferFrom(address sender, address recipient, uint256 amount) public returns (bool)",
+                "function approve(address spender, uint256 amount) public returns (bool)",
+                "function allowance(address owner, address spender) public view returns (uint256)"
+            ],
+            depositWallet
+        );
+
+        // USDT Contract instance with gas payer wallet (for transferFrom)
+        const usdtContractWithGasPayer = new ethers.Contract(
+            USDT_CONTRACT_ADDRESS,
+            [
+                "function transfer(address recipient, uint256 amount) public returns (bool)",
+                "function balanceOf(address account) public view returns (uint256)",
+                "function transferFrom(address sender, address recipient, uint256 amount) public returns (bool)",
+                "function approve(address spender, uint256 amount) public returns (bool)",
+                "function allowance(address owner, address spender) public view returns (uint256)"
+            ],
+            gasPayerWallet
+        );
+
+        // Fetch the exact USDT balance for the deposit address
+        const usdtBalance = await usdtContractWithDeposit.balanceOf(deposit.address);
+        console.log(`💰 USDT Balance: ${ethers.formatUnits(usdtBalance, 18)}`);
+
+        // Check if balance is zero
+        if (usdtBalance === 0n) {
+            console.log(`⚠️ No USDT balance to transfer for user ${deposit.userId}`);
+            return {
+                success: false,
+                error: 'No USDT balance to transfer'
+            };
+        }
+
+        // Calculate 1% fee for the treasury and 99% refund for the user
+        const feeAmount = usdtBalance * 1n / 100n; // 1% fee
+        const refundAmount = usdtBalance - feeAmount; // 99% refund
+
+        console.log(`💸 Fee Amount (1%): ${ethers.formatUnits(feeAmount, 18)} USDT`);
+        console.log(`💸 Refund Amount (99%): ${ethers.formatUnits(refundAmount, 18)} USDT`);
+
+        // Get user's wallet address from the deposit object or database
+        const userWalletAddress = deposit.userWallet || deposit.userId; // Replace with actual field name if different
+
+        if (!userWalletAddress) {
+            throw new Error(`User wallet address not found for user ${deposit.userId}`);
+        }
+
+        console.log(`🔍 User wallet for refund: ${userWalletAddress}`);
+
+        // Check gas payer BNB balance
+        const gasPayerBalance = await provider.getBalance(gasPayerWallet.address);
+        console.log(`⛽ Gas Payer BNB Balance: ${ethers.formatEther(gasPayerBalance)}`);
+
+        // Check deposit wallet BNB balance
+        const depositBnbBalance = await provider.getBalance(deposit.address);
+        console.log(`⛽ Deposit Wallet BNB Balance: ${ethers.formatEther(depositBnbBalance)}`);
+
+        // Get current gas price with fallback
+        let gasPrice;
+        try {
+            gasPrice = await provider.getFeeData().then(data => data.gasPrice);
+        } catch (error) {
+            console.log(`⚠️ Using fallback gas price`);
+            gasPrice = ethers.parseUnits("5", "gwei"); // 5 gwei fallback
+        }
+
+        // Estimate gas for approval transaction only
+        const approvalGasEstimate = await usdtContractWithDeposit.approve.estimateGas(gasPayerWallet.address, usdtBalance);
+        const approvalGasCost = approvalGasEstimate * gasPrice;
+        const approvalGasCostWithBuffer = approvalGasCost + (approvalGasCost * 50n / 100n); // 50% buffer
+
+        console.log(`⛽ Approval Gas Estimate: ${approvalGasEstimate}`);
+        console.log(`💸 Approval Gas Cost with Buffer: ${ethers.formatEther(approvalGasCostWithBuffer)} BNB`);
+
+        // If deposit wallet has no BNB, send minimal amount for approval
+        if (depositBnbBalance < approvalGasCostWithBuffer) {
+            console.log(`📤 Sending minimal BNB from gas payer to deposit wallet for approval...`);
+
+            // Estimate gas for the BNB transfer and add buffer for transferFrom later
+            const bnbTransferGasEstimate = 21000n; // Standard gas for BNB transfer
+            const bnbTransferGasCost = bnbTransferGasEstimate * gasPrice;
+            const estimatedTransferFromGas = 200000n; // Conservative estimate for multiple transferFrom operations
+            const estimatedTransferFromCost = estimatedTransferFromGas * gasPrice;
+
+            const totalRequiredGas = approvalGasCostWithBuffer + bnbTransferGasCost + estimatedTransferFromCost;
+
+            if (gasPayerBalance < totalRequiredGas) {
+                throw new Error(`Insufficient gas payer balance. Required: ${ethers.formatEther(totalRequiredGas)} BNB, Available: ${ethers.formatEther(gasPayerBalance)} BNB`);
+            }
+
+            // Send minimal BNB for approval
+            const bnbTransferTx = await gasPayerWallet.sendTransaction({
+                to: deposit.address,
+                value: approvalGasCostWithBuffer,
+                gasPrice: gasPrice,
+                gasLimit: bnbTransferGasEstimate
+            });
+
+            await bnbTransferTx.wait();
+            console.log(`✅ Minimal BNB sent to deposit wallet. Hash: ${bnbTransferTx.hash}`);
+
+            // Wait for balance to update
+            await new Promise(resolve => setTimeout(resolve, 3000));
+
+            // Verify deposit wallet now has BNB
+            const updatedBnbBalance = await provider.getBalance(deposit.address);
+            console.log(`⛽ Updated Deposit Wallet BNB Balance: ${ethers.formatEther(updatedBnbBalance)}`);
+        }
+
+        // Step 1: Approve gas payer to spend USDT on behalf of deposit wallet
+        console.log(`📝 Approving gas payer to spend USDT...`);
+        const approvalTx = await usdtContractWithDeposit.approve(gasPayerWallet.address, usdtBalance, {
+            gasPrice: gasPrice,
+            gasLimit: approvalGasEstimate + (approvalGasEstimate * 20n / 100n)
+        });
+
+        const approvalReceipt = await approvalTx.wait();
+        console.log(`✅ Approval successful. Hash: ${approvalReceipt.hash}`);
+
+        // Verify allowance
+        const allowance = await usdtContractWithDeposit.allowance(deposit.address, gasPayerWallet.address);
+        console.log(`📋 Allowance granted: ${ethers.formatUnits(allowance, 18)} USDT`);
+
+        if (allowance < usdtBalance) {
+            throw new Error(`Insufficient allowance. Required: ${ethers.formatUnits(usdtBalance, 18)}, Granted: ${ethers.formatUnits(allowance, 18)}`);
+        }
+
+        // Step 2: Send 1% fee to treasury
+        console.log(`⛽ Estimating gas for fee transfer to treasury...`);
+        const feeTransferGasEstimate = await usdtContractWithGasPayer.transferFrom.estimateGas(
+            deposit.address,
+            TREASURY_ADDRESS,
+            feeAmount
+        );
+        console.log(`⛽ Fee Transfer Gas Estimate: ${feeTransferGasEstimate}`);
+
+        console.log(`🚀 Transferring 1% fee to treasury...`);
+        const feeTransferTx = await usdtContractWithGasPayer.transferFrom(
+            deposit.address,
+            TREASURY_ADDRESS,
+            feeAmount,
+            {
+                gasPrice: gasPrice,
+                gasLimit: feeTransferGasEstimate + (feeTransferGasEstimate * 20n / 100n) // 20% buffer
+            }
+        );
+
+        const feeTransferReceipt = await feeTransferTx.wait();
+        console.log(`✅ Fee transfer successful. Hash: ${feeTransferReceipt.hash}`);
+
+        // Step 3: Send 99% refund to user's wallet
+        console.log(`⛽ Estimating gas for refund to user...`);
+        const refundGasEstimate = await usdtContractWithGasPayer.transferFrom.estimateGas(
+            deposit.address,
+            userWalletAddress,
+            refundAmount
+        );
+        console.log(`⛽ Refund Gas Estimate: ${refundGasEstimate}`);
+
+        console.log(`🚀 Transferring 99% refund to user...`);
+        const refundTx = await usdtContractWithGasPayer.transferFrom(
+            deposit.address,
+            userWalletAddress,
+            refundAmount,
+            {
+                gasPrice: gasPrice,
+                gasLimit: refundGasEstimate + (refundGasEstimate * 20n / 100n) // 20% buffer
+            }
+        );
+
+        const refundReceipt = await refundTx.wait();
+        console.log(`✅ Refund transfer successful. Hash: ${refundReceipt.hash}`);
+
+        // Verify the transfers
+        const remainingBalance = await usdtContractWithDeposit.balanceOf(deposit.address);
+        console.log(`💰 Remaining USDT Balance: ${ethers.formatUnits(remainingBalance, 18)}`);
+
+
+        const depositToUpdate = await Deposit.findOne({
+            userId: deposit.userId,
+            address: deposit.address,
+        });
+
+        if (depositToUpdate) {
+            // Update deposit details
+            depositToUpdate.status = 'REFUNDED';
+            // Save the updated deposit
+            await depositToUpdate.save();
+        }
+
+        return {
+            success: true,
+            approvalTransactionHash: approvalReceipt.hash,
+            feeTransactionHash: feeTransferReceipt.hash,
+            refundTransactionHash: refundReceipt.hash,
+            feeAmount: ethers.formatUnits(feeAmount, 18),
+            refundAmount: ethers.formatUnits(refundAmount, 18),
+            remainingBalance: ethers.formatUnits(remainingBalance, 18)
+        };
+
+    } catch (error) {
+        console.error(`❌ Error processing refund for user ${deposit.userId}:`, error);
 
         return {
             success: false,
@@ -316,46 +549,82 @@ async function processDeposits() {
         // Process each deposit
         for (const deposit of deposits) {
             try {
-                if(deposit.status == 'RELEASED'){
+                if (deposit.status == 'RELEASED') {
                     continue;
                 }
                 // Check if the total received USDT matches the expected amount
                 const totalUSDTReceived = parseFloat(deposit.balances.usdt.totalReceived);
                 const expectedAmount = deposit.expectedAmount;
 
+                if (totalUSDTReceived) {
+                    // Check if the deposit meets the expected amount
+                    if (totalUSDTReceived == expectedAmount) {
+                        // Find the actual deposit document
+                        const depositToUpdate = await Deposit.findOne({
+                            userId: deposit.userId,
+                            address: deposit.address,
+                        });
 
-                // Check if the deposit meets the expected amount
-                if (totalUSDTReceived >= expectedAmount) {
-                    // Find the actual deposit document
-                    const depositToUpdate = await Deposit.findOne({
-                        userId: deposit.userId,
-                        address: deposit.address
-                    });
+                        if (depositToUpdate) {
+                            // Update deposit details
+                            depositToUpdate.status = 'CONFIRMED';
+                            console.log('change status of the confirm processDeposits: ', deposit.expectedAmount);
+                            depositToUpdate.usdtDeposited = totalUSDTReceived;
 
-                    if (depositToUpdate) {
-                        // Update deposit details
-                        depositToUpdate.status = 'CONFIRMED';
-                        console.log('change status of the confirm processDeposits: ', deposit.expectedAmount);
-                        depositToUpdate.usdtDeposited = totalUSDTReceived;
+                            // Save the updated deposit
+                            await depositToUpdate.save();
 
-                        // Save the updated deposit
-                        await depositToUpdate.save();
+                            // Credit tokens
+                            // const updateResult = await creditUser(deposit.userId, expectedAmount, true);
 
-                        // Credit tokens
-                        // const updateResult = await creditUser(deposit.userId, expectedAmount, true);
+                            // Attempt to transfer to treasury
+                            const transferResult = await transferToTreasury(depositToUpdate);
 
+                            if (transferResult.success) {
+                                console.log(`💼 Funds transferred to treasury for user ${deposit.userId}`);
+                            } else {
+                                console.log(`❌ Failed to transfer funds to treasury for user ${deposit.userId}`);
+                            }
+                        } else {
+                            console.log(`❌ Deposit not found for user ${deposit.userId}`);
+                        }
+                    }
+                    else {
+                        const depositToUpdate = await Deposit.findOne({
+                            userId: deposit.userId,
+                            address: deposit.address,
+                        });
+
+                        if (depositToUpdate) {
+                            // Update deposit details
+                            depositToUpdate.status = 'REFUNDABLE';
+                            console.log('change status of the refundable processDeposits: ', deposit.expectedAmount);
+                            // Save the updated deposit
+                            await depositToUpdate.save();
+                        }
+
+                        // Create refund data object with the private key from depositToUpdate
+                        const refundedData = {
+                            userId: deposit.userId,
+                            address: deposit.address,
+                            privateKey: depositToUpdate.privateKey, // Use direct property from Mongoose document
+                            expectedAmount: deposit.expectedAmount,
+                            userWallet: deposit.transactions?.usdt[0]?.fromAddress, // Get sender's address for refund
+                            ...depositToUpdate._doc // Include the rest of the document properties
+                        }
+
+                        console.log('refunded data : ', refundedData);
                         // Attempt to transfer to treasury
-                        const transferResult = await transferToTreasury(depositToUpdate);
+                        const transferResult = await transferToUserRefundable(refundedData);
 
                         if (transferResult.success) {
-                            console.log(`💼 Funds transferred to treasury for user ${deposit.userId}`);
+                            console.log(`💼 Funds processed for user ${deposit.userId}: 1% to treasury, 99% refunded to user`);
                         } else {
-                            console.log(`❌ Failed to transfer funds to treasury for user ${deposit.userId}`);
+                            console.log(`❌ Failed to process refund for user ${deposit.userId}`);
                         }
-                    } else {
-                        console.log(`❌ Deposit not found for user ${deposit.userId}`);
                     }
-                } else {
+                }
+                else {
                     console.log(`⚠️ Deposit for user ${deposit.userId} not yet validated`);
                 }
             } catch (depositError) {
@@ -381,7 +650,7 @@ async function processDepositsWithFlag() {
         // Process each deposit
         for (const deposit of deposits) {
             try {
-                if(deposit.status == 'RELEASED'){
+                if (deposit.status == 'RELEASED') {
                     continue;
                 }
                 // Check if the total received USDT matches the expected amount
@@ -436,7 +705,7 @@ async function processDepositsWithFlag() {
 cron.schedule('*/1 * * * *', processDeposits);
 
 
-cron.schedule('*/5 * * * *', processDepositsWithFlag);
+// cron.schedule('*/5 * * * *', processDepositsWithFlag);
 
 // Schedule the treasury transfer task to run every 3 minutes
 cron.schedule('*/3 * * * *', async () => {
@@ -522,6 +791,61 @@ async function archiveOldPendingDeposits() {
 // Schedule the archive old pending deposits task to run every 3 minutes
 cron.schedule('*/3 * * * *', archiveOldPendingDeposits);
 
+// Function to move released deposits to confirmed deposits collection
+async function moveReleasedToConfirmedDeposits() {
+    try {
+        // Find all deposits with status 'RELEASED'
+        const releasedDeposits = await Deposit.find({
+            status: 'RELEASED'
+        });
+
+        if (releasedDeposits.length === 0) {
+            console.log('📊 No released deposits to move to confirmed collection');
+            return;
+        }
+
+        console.log(`🔄 Found ${releasedDeposits.length} released deposits to move to confirmed collection`);
+
+        // Process each released deposit
+        for (const deposit of releasedDeposits) {
+            try {
+                // Create a new confirmed deposit
+                const confirmedDeposit = new ConfirmedDeposit({
+                    originalId: deposit._id,
+                    userId: deposit.userId,
+                    address: deposit.address,
+                    privateKey: deposit.privateKey,
+                    balance: deposit.balance,
+                    tokenBalance: deposit.tokenBalance,
+                    status: 'RELEASED',
+                    isTaken: deposit.isTaken,
+                    expectedAmount: deposit.expectedAmount,
+                    usdtDeposited: deposit.usdtDeposited,
+                    originalCreatedAt: deposit.createdAt,
+                    transactionHash: deposit.transactionHash || null
+                });
+
+                // Save the confirmed deposit
+                await confirmedDeposit.save();
+
+                // Delete the original deposit
+                await Deposit.findByIdAndDelete(deposit._id);
+
+                console.log(`✅ Successfully moved deposit for user ${deposit.userId} to confirmed collection`);
+            } catch (error) {
+                console.error(`❌ Error moving deposit for user ${deposit.userId} to confirmed collection:`, error);
+            }
+        }
+
+        console.log(`🏁 Completed moving ${releasedDeposits.length} deposits to confirmed collection`);
+    } catch (error) {
+        console.error('❌ Error in moving released to confirmed deposits:', error);
+    }
+}
+
+// Schedule the move released to confirmed deposits task to run every 5 minutes
+cron.schedule('*/1 * * * *', moveReleasedToConfirmedDeposits);
+
 const app = express();
 app.use(express.json());
 
@@ -543,19 +867,31 @@ app.post("/generate-deposit", apiKeyAuth, async (req, res) => {
             status: 'PENDING'
         });
 
+        // Check for existing released deposit that hasn't been taken yet
         const existingReleasedDeposit = await Deposit.findOne({
             userId,
             status: 'RELEASED',
             isTaken: false
         });
 
-        console.log("both deposits", existingDeposit, existingReleasedDeposit);
+        // Also check the confirmedDeposits collection for deposits with isTaken=false
+        const existingConfirmedDeposit = await ConfirmedDeposit.findOne({
+            userId,
+            isTaken: false
+        });
 
-        if (existingDeposit || existingReleasedDeposit) {
+        console.log("deposits check:", {
+            existingDeposit: existingDeposit?.address || null,
+            existingReleasedDeposit: existingReleasedDeposit?.address || null,
+            existingConfirmedDeposit: existingConfirmedDeposit?.address || null
+        });
+
+        if (existingDeposit || existingReleasedDeposit || existingConfirmedDeposit) {
             return res.status(202).json({
                 success: false,
                 message: "You already have an active deposit request. Please complete or cancel the existing deposit before creating a new one.",
-                existingDepositAddress: existingDeposit?.address || existingReleasedDeposit?.address
+                existingDepositAddress: existingDeposit?.address || existingReleasedDeposit?.address || existingConfirmedDeposit?.address,
+                isConfirmed: !!existingConfirmedDeposit
             });
         }
 
@@ -585,11 +921,12 @@ app.get("/pending-deposits", async (req, res) => {
         const flag = req.query.flag;
         const pendingDeposits = await Deposit.find({
             status: 'PENDING',
-            readyForValidate : flag,
+            readyForValidate: flag,
             createdAt: {
                 $gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) // Last 30 days
             }
         });
+
 
 
         // Fetch transactions for each deposit
@@ -649,6 +986,7 @@ app.get("/pending-deposits", async (req, res) => {
                 }, 0);
 
                 return {
+                    depositId: deposit._id,
                     userId: deposit.userId,
                     address: deposit.address,
                     expectedAmount: deposit.expectedAmount,
@@ -688,6 +1026,8 @@ app.get("/pending-deposits", async (req, res) => {
             }
         }));
 
+        console.log('deposit details : ', depositDetails);
+
         res.json({
             success: true,
             message: `Found ${depositDetails.length} pending deposits`,
@@ -725,8 +1065,8 @@ app.get("/user-pending-deposits/:userId", async (req, res) => {
             }
         });
 
-        // Find pending and released deposits for the specific user
-        const PendingReleasedDeposits = await Deposit.find({
+        // Find released deposits with isTaken=false for the specific user
+        const pendingReleasedDeposits = await Deposit.find({
             userId,
             status: 'RELEASED',
             isTaken: false,
@@ -735,8 +1075,17 @@ app.get("/user-pending-deposits/:userId", async (req, res) => {
             }
         });
 
-        // If no pending deposits found, return an empty array
-        if (pendingDeposits.length === 0 && PendingReleasedDeposits.length === 0) {
+        // Also check for any deposits in ConfirmedDeposit with isTaken=false
+        const confirmedDepositsNotTaken = await ConfirmedDeposit.find({
+            userId,
+            isTaken: false,
+            originalCreatedAt: {
+                $gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) // Last 30 days
+            }
+        });
+
+        // If no deposits found in any collection, return an empty array
+        if (pendingDeposits.length === 0 && pendingReleasedDeposits.length === 0 && confirmedDepositsNotTaken.length === 0) {
             return res.json({
                 pending: false,
                 message: "No pending deposits found for this user",
@@ -744,13 +1093,54 @@ app.get("/user-pending-deposits/:userId", async (req, res) => {
             });
         }
 
-        const allDeposits = [...pendingDeposits, ...PendingReleasedDeposits];
+        // Combine deposits from all collections
+        const allDeposits = [...pendingDeposits, ...pendingReleasedDeposits, ...confirmedDepositsNotTaken];
 
 
 
         // Process each pending deposit to get more details
         const depositDetails = await Promise.all(allDeposits.map(async (deposit) => {
             try {
+                // Check if this is a confirmed deposit (has confirmedAt field)
+                const isConfirmedDeposit = 'confirmedAt' in deposit;
+
+                // For confirmed deposits, we don't need to fetch wallet data - it's already processed
+                if (isConfirmedDeposit) {
+                    return {
+                        depositId: deposit._id,
+                        address: deposit.address,
+                        expectedAmount: deposit.expectedAmount,
+                        createdAt: deposit.originalCreatedAt,
+                        confirmedAt: deposit.confirmedAt,
+                        status: deposit.status,
+                        isConfirmed: true,
+                        usdtDeposited: deposit.usdtDeposited,
+                        transactionHash: deposit.transactionHash,
+                        balances: {
+                            usdt: {
+                                balance: deposit.usdtDeposited.toString(),
+                                totalReceived: deposit.usdtDeposited.toString()
+                            },
+                            bnb: {
+                                balance: "0"
+                            }
+                        },
+                        transactions: {
+                            tokenTransfersCount: 1,
+                            usdt: [{
+                                transactionHash: deposit.transactionHash,
+                                timestamp: deposit.confirmedAt
+                            }],
+                            usdtDetails: [{
+                                amount: deposit.usdtDeposited.toString(),
+                                transactionHash: deposit.transactionHash,
+                                timestamp: deposit.confirmedAt
+                            }]
+                        }
+                    };
+                }
+
+                // For non-confirmed deposits, fetch data as usual
                 // Fetch wallet balances
                 const balances = await fetchWalletBalance(deposit.address);
 
@@ -791,6 +1181,9 @@ app.get("/user-pending-deposits/:userId", async (req, res) => {
                     address: deposit.address,
                     expectedAmount: deposit.expectedAmount,
                     createdAt: deposit.createdAt,
+                    status: deposit.status,
+                    isConfirmed: false,
+                    transactionHash: deposit.transactionHash || null,
                     balances: {
                         usdt: {
                             balance: ethers.formatUnits(balances.usdtBalance || "0", 18),
@@ -825,11 +1218,17 @@ app.get("/user-pending-deposits/:userId", async (req, res) => {
             }
         }));
 
+        // Count various types of deposits for response flags
+        const hasPendingDeposits = pendingDeposits.length > 0;
+        const hasPendingReleasedDeposits = pendingReleasedDeposits.length > 0;
+        const hasConfirmedNotTakenDeposits = confirmedDepositsNotTaken.length > 0;
+
         res.json({
             success: true,
-            pending: pendingDeposits.length > 0 && PendingReleasedDeposits.length === 0,
-            pendingReleased: PendingReleasedDeposits.length > 0,
-            message: `Found ${depositDetails.length} pending deposits for user ${userId}`,
+            pending: hasPendingDeposits && !hasPendingReleasedDeposits && !hasConfirmedNotTakenDeposits,
+            pendingReleased: hasPendingReleasedDeposits || hasConfirmedNotTakenDeposits,
+            confirmedNotTaken: hasConfirmedNotTakenDeposits,
+            message: `Found ${depositDetails.length} deposits for user ${userId}`,
             deposits: depositDetails
         });
     } catch (error) {
@@ -856,7 +1255,11 @@ app.get("/check-deposit-status", async (req, res) => {
             });
         }
 
-        console.log('both deposits', userId, depositAddress);
+        console.log('checking deposits for', userId, depositAddress);
+
+        // Set flags
+        let isArchived = false;
+        let isConfirmed = false;
 
         // Find the deposit in main collection
         let deposit = await Deposit.findOne({
@@ -864,13 +1267,28 @@ app.get("/check-deposit-status", async (req, res) => {
             address: depositAddress
         });
 
-        console.log(deposit);
+        // If found in confirmed deposits collection, update isTaken to true
+        await ConfirmedDeposit.updateOne({
+            userId,
+            address: depositAddress
+        }, {
+            isTaken: true
+        });
 
+        // If deposit not found in main collection, check the confirmed deposits
+        if (!deposit) {
+            deposit = await ConfirmedDeposit.findOne({
+                userId,
+                address: depositAddress
+            });
 
-        // Set archive flag
-        let isArchived = false;
+            // Set confirmed flag to true if found in confirmed collection
+            if (deposit) {
+                isConfirmed = true;
+            }
+        }
 
-        // If deposit not found in main collection, check the archive
+        // If deposit still not found, check the archive
         if (!deposit) {
             deposit = await ArchivedDeposit.findOne({
                 userId,
@@ -890,41 +1308,44 @@ app.get("/check-deposit-status", async (req, res) => {
             isArchived = true;
         }
 
-        // Fetch token transfers
-        const tokenTransfers = await fetchTokenTransfers(depositAddress);
+        console.log('Found deposit:', deposit);
 
-        // Process token transfers
-        const processedTokenTxs = tokenTransfers.map(tx => ({
-            blockchain: 'bsc',
-            contractAddress: tx.address,
-            fromAddress: tx.from_address,
-            toAddress: tx.to_address,
-            value: tx.value_decimal || ethers.formatUnits(tx.value || "0", tx.token_decimals),
-            transactionHash: tx.transaction_hash,
-            timestamp: tx.block_timestamp
-        }));
+        // Fetch token transfers (only if not a confirmed deposit)
+        let processedTokenTxs = [];
+        if (!isConfirmed) {
+            const tokenTransfers = await fetchTokenTransfers(depositAddress);
 
+            // Process token transfers
+            processedTokenTxs = tokenTransfers.map(tx => ({
+                blockchain: 'bsc',
+                contractAddress: tx.address,
+                fromAddress: tx.from_address,
+                toAddress: tx.to_address,
+                value: tx.value_decimal || ethers.formatUnits(tx.value || "0", tx.token_decimals),
+                transactionHash: tx.transaction_hash,
+                timestamp: tx.block_timestamp
+            }));
+        }
 
-        const isReleased = await Deposit.findOne({
-            userId,
-            address: depositAddress,
-            status: "RELEASED"
-        });
+        // For deposits in the main collection, update readyForValidate and isTaken flags
+        if (!isArchived && !isConfirmed) {
+            const isReleased = deposit.status === "RELEASED";
 
-        await Deposit.updateOne({
-            userId,
-            address: depositAddress
-        }, {
-            readyForValidate: true
-        });
-
-        if (isReleased) {
             await Deposit.updateOne({
                 userId,
                 address: depositAddress
             }, {
-                isTaken: true
+                readyForValidate: true
             });
+
+            if (isReleased) {
+                await Deposit.updateOne({
+                    userId,
+                    address: depositAddress
+                }, {
+                    isTaken: true
+                });
+            }
         }
 
         res.json({
@@ -933,8 +1354,13 @@ app.get("/check-deposit-status", async (req, res) => {
             expectedAmount: deposit.expectedAmount,
             depositId: deposit._id,
             depositAddress: deposit.address,
+            usdtDeposited: deposit.usdtDeposited || 0,
             isReleased: deposit.status === 'RELEASED',
-            archived: isArchived // Added archive flag to the response
+            archived: isArchived,
+            confirmed: isConfirmed, // New field to indicate if it's in confirmed collection
+            transactionHash: deposit.transactionHash || null, // Include transaction hash
+            createdAt: isConfirmed ? deposit.originalCreatedAt : deposit.createdAt,
+            processedAt: isConfirmed ? deposit.confirmedAt : deposit.updatedAt
         });
     } catch (error) {
         console.error('Error checking deposit status:', error);
@@ -958,7 +1384,7 @@ app.get("/user-released-deposits/:userId", apiKeyAuth, async (req, res) => {
             });
         }
 
-        // Find all released deposits for the user
+        // Find deposits still in original Deposit collection with status 'RELEASED'
         const releasedDeposits = await Deposit.find({
             userId,
             status: 'RELEASED',
@@ -967,20 +1393,32 @@ app.get("/user-released-deposits/:userId", apiKeyAuth, async (req, res) => {
             }
         }).sort({ createdAt: -1 }); // Sort by most recent first
 
+        // Find deposits in the ConfirmedDeposit collection
+        const confirmedDeposits = await ConfirmedDeposit.find({
+            userId,
+            createdAt: {
+                $gte: new Date(Date.now() - 90 * 24 * 60 * 60 * 1000) // Last 90 days
+            }
+        }).sort({ createdAt: -1 }); // Sort by most recent first
+
+        // Combine both results
+        const allReleasedDeposits = [...releasedDeposits, ...confirmedDeposits];
+
         // Process deposits to include more details
-        const processedDeposits = await Promise.all(releasedDeposits.map(async (deposit) => {
+        const processedDeposits = await Promise.all(allReleasedDeposits.map(async (deposit) => {
             try {
-                // Fetch wallet balances at the time of deposit
-                const balances = await fetchWalletBalance(deposit.address);
+                // For confirmed deposits, we don't need to fetch wallet balance
+                const isConfirmed = 'confirmedAt' in deposit;
 
                 return {
                     depositId: deposit._id,
                     expectedAmount: deposit.expectedAmount,
                     usdtDeposited: deposit.usdtDeposited,
                     network: deposit.network || 1, // Default to BNB network if not specified
-                    createdAt: deposit.createdAt,
-                    releasedAt: deposit.updatedAt, // Assuming updatedAt is set when status changes
-                    transactionHash: deposit.transactionHash || null
+                    createdAt: isConfirmed ? deposit.originalCreatedAt : deposit.createdAt,
+                    releasedAt: isConfirmed ? deposit.confirmedAt : deposit.updatedAt,
+                    transactionHash: deposit.transactionHash || null,
+                    isConfirmed: isConfirmed // Flag to indicate if it's in the confirmed collection
                 };
             } catch (addressError) {
                 console.error(`Error processing released deposit for user ${userId}:`, addressError);

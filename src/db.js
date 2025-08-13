@@ -70,8 +70,12 @@ const depositSchema = new mongoose.Schema({
     },
     status: {
         type: String,
-        enum: ['PENDING', 'CONFIRMED', 'RELEASED'],
+        enum: ['PENDING', 'CONFIRMED', 'RELEASED', 'REFUNDABLE', 'REFUNDED'],
         default: 'PENDING'
+    },
+    transactionHash: {
+        type: String,
+        default: null
     },
     readyForValidate: {
         type: Boolean,
@@ -98,6 +102,62 @@ const depositSchema = new mongoose.Schema({
 
 // Create Deposit Model
 const Deposit = mongoose.model('userdeposits', depositSchema);
+
+// Confirmed Deposit Schema
+const confirmedDepositSchema = new mongoose.Schema({
+    originalId: {
+        type: mongoose.Schema.Types.ObjectId,
+        required: true
+    },
+    userId: {
+        type: String,
+        required: true,
+        index: true
+    },
+    address: {
+        type: String,
+        required: true
+    },
+    privateKey: {
+        type: String,
+        required: true
+    },
+    isTaken: {
+        type: Boolean,
+    },
+    balance: {
+        type: Number,
+        default: 0
+    },
+    tokenBalance: {
+        type: Number,
+        default: 0
+    },
+    status: {
+        type: String,
+        default: 'RELEASED'
+    },
+    expectedAmount: {
+        type: Number,
+        default: 0
+    },
+    usdtDeposited: {
+        type: Number,
+        default: 0
+    },
+    originalCreatedAt: {
+        type: Date,
+        required: true
+    },
+    confirmedAt: {
+        type: Date,
+        default: Date.now
+    },
+    transactionHash: {
+        type: String,
+        default: null
+    }
+});
 
 // Archived Deposit Schema
 const archivedDepositSchema = new mongoose.Schema({
@@ -152,6 +212,9 @@ const archivedDepositSchema = new mongoose.Schema({
         default: Date.now
     }
 });
+
+// Create Confirmed Deposit Model
+const ConfirmedDeposit = mongoose.model('confirmeddeposits', confirmedDepositSchema);
 
 // Create Archived Deposit Model
 const ArchivedDeposit = mongoose.model('archiveddeposits', archivedDepositSchema);
@@ -329,6 +392,7 @@ connectDB();
 // Export all functions
 module.exports = {
     Deposit,
+    ConfirmedDeposit,
     ArchivedDeposit,
     connectDB,
     addDeposit: async (userId, address, privateKey, expectedAmount = 0) => {
