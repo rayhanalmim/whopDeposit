@@ -1,0 +1,5 @@
+{
+  "scripts": {
+    "vercel-build": "node --experimental-json-modules ./node_modules/.bin/next build"
+  }
+}

@@ -1,5 +1,5 @@
 {
-  "name": "bnb-deposit-tracker",
+  "name": "whop",
   "version": "1.0.0",
   "description": "BNB and USDT Deposit Tracking System",
   "main": "src/server.js",
