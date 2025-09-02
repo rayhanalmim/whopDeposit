@@ -21,10 +21,6 @@ router.get('/google/callback',
   passport.authenticate('google', { failureRedirect: '/login' }),
   async (req, res) => {
     try {
-      // Sync newly authenticated user with Whop
-      if (req.user && !req.user.whopUserId) {
-        await syncUserWithWhop(req.user);
-      }
       res.redirect('http://localhost:3000');
     } catch (error) {
       console.error(`[${new Date().toISOString()}] Error in OAuth callback:`, error, res);

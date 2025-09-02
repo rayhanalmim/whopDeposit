@@ -7,119 +7,98 @@ const User = require('../models/User');
 const Transaction = require('../models/Transaction');
 
 // Create a deposit (simplified version)
-router.post('/create', isAuthenticated, async (req, res) => {
+// Modified deposit route without isAuthenticated middleware
+router.post('/create', async (req, res) => {
     try {
-      const { amount } = req.body;
-      const userId = req.user.id;
-      
-      if (!amount || isNaN(parseFloat(amount)) || parseFloat(amount) <= 0) {
-        return res.status(400).json({ 
-          success: false, 
-          message: 'Invalid amount' 
+        const { amount, user } = req.body;
+
+        // Validate required fields
+        if (!amount || isNaN(parseFloat(amount)) || parseFloat(amount) <= 0) {
+            return res.status(400).json({
+                success: false,
+                message: 'Invalid amount'
+            });
+        }
+
+        if (!user || !user.id || !user.email) {
+            return res.status(400).json({
+                success: false,
+                message: 'User data is required'
+            });
+        }
+
+        // Find or create user in database (if needed)
+        let dbUser = await User.findOne({ email: user.email });
+
+        if (!dbUser) {
+            // Create new user record if needed
+            dbUser = new User({
+                email: user.email,
+                name: user.name,
+                picture: user.picture,
+                balance: 0
+            });
+            await dbUser.save();
+        }
+
+        const userId = dbUser._id;
+
+        // Create transaction record in pending state
+        const pendingTransaction = await createTransaction({
+            userId,
+            type: 'deposit',
+            amount: parseFloat(amount),
+            currency: 'usd',
+            status: 'pending',
+            createdBy: dbUser.name || dbUser.email,
+            notes: 'Deposit initiated via webapp'
         });
-      }
 
-      const currentuser = await whopSdk.users.getCurrentUser();
-      
-      // Log the transaction attempt
-      console.log(`Creating charge for user`, currentuser);
-      
-      // Create transaction record in pending state
-      const pendingTransaction = await createTransaction({
-        userId,
-        type: 'deposit',
-        amount: parseFloat(amount),
-        currency: 'usd',
-        status: 'pending',
-        createdBy: req.user.name || req.user.email,
-        notes: 'Deposit initiated via webapp'
-      });
-      
-      // Use your agent user ID directly
-      const agentUserId = process.env.WHOP_AGENT_USER_ID || "user_vkkJspp0eI1SK";
-      
-      // Use chargeUser method with direct agent ID
-      const result = await whopSdk.payments.chargeUser({
-        amount: amount, // Convert to cents
-        currency: "usd",
-        userId: agentUserId, // Direct use of agent ID
-        metadata: {
-          mongoUserId: userId,
-          transactionId: pendingTransaction._id.toString(),
-          type: "deposit",
-          amount: parseFloat(amount),
-          createdBy: "rayhanalmim",
-          createdAt: new Date().toISOString()
-        },
-      });
-      
-      if (!result?.inAppPurchase) {
-        // Update transaction to failed
-        pendingTransaction.status = 'failed';
-        await pendingTransaction.save();
-        
-        return res.status(500).json({
-          success: false,
-          message: 'Failed to create charge'
+        // Use your agent user ID directly
+        const agentUserId = process.env.WHOP_AGENT_USER_ID || "user_vkkJspp0eI1SK";
+
+        // Use chargeUser method with direct agent ID
+        const result = await whopSdk.payments.chargeUser({
+            amount: amount,
+            currency: "usd",
+            userId: agentUserId,
+            metadata: {
+                mongoUserId: userId,
+                transactionId: pendingTransaction._id.toString(),
+                type: "deposit",
+                amount: parseFloat(amount),
+                createdBy: dbUser.name || "client",
+                createdAt: new Date().toISOString()
+            },
         });
-      }
 
+        if (!result?.inAppPurchase) {
+            pendingTransaction.status = 'failed';
+            await pendingTransaction.save();
 
-      console.log('done, make the transaction successful');
-      
-      return res.json({
-        success: true,
-        inAppPurchase: result.inAppPurchase,
-        transactionId: pendingTransaction._id
-      });
-      
+            return res.status(500).json({
+                success: false,
+                message: 'Failed to create charge'
+            });
+        }
+
+        console.log('done, make the transaction successful');
+
+        return res.json({
+            success: true,
+            inAppPurchase: result.inAppPurchase,
+            transactionId: pendingTransaction._id
+        });
+
     } catch (error) {
-      console.error(`[${new Date().toISOString()}] Error creating deposit:`, error);
-      return res.status(500).json({
-        success: false,
-        message: error.message || 'Failed to create deposit'
-      });
+        console.error(`[${new Date().toISOString()}] Error creating deposit:`, error);
+        return res.status(500).json({
+            success: false,
+            message: error.message || 'Failed to create deposit'
+        });
     }
-  });
-
-// Confirm a deposit
-router.post('/confirm', isAuthenticated, async (req, res) => {
-  try {
-    const { receiptId, amount, transactionId } = req.body;
-    const userId = req.user.id;
-    
-    // Process the deposit
-    const result = await processDeposit(userId, receiptId, parseFloat(amount), {
-      receiptId,
-      confirmedVia: 'client',
-      confirmationTime: new Date().toISOString(),
-      transactionId
-    });
-    
-    // Update the specific transaction if provided
-    if (transactionId) {
-      const transaction = await Transaction.findById(transactionId);
-      if (transaction) {
-        transaction.status = 'completed';
-        transaction.receiptId = receiptId;
-        transaction.updatedBy = req.user.name || req.user.email;
-        await transaction.save();
-      }
-    }
-    
-    return res.json({
-      success: true,
-      message: 'Deposit confirmed and balance updated',
-      newBalance: result.user.balance
-    });
-    
-  } catch (error) {
-    console.error(`[${new Date().toISOString()}] Error confirming deposit:`, error);
-    return res.status(500).json({
-      success: false,
-      message: error.message || 'Failed to confirm deposit'
-    });
-  }
 });
+
+
 
 module.exports = router;
