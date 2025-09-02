@@ -1,9 +1,29 @@
 {
-    "$schema": "https://openapi.vercel.sh/vercel.json",
-    "crons": [
-        {
-            "path": "/pending-deposits",
-            "schedule": "0 * * * *"
+    "version": 2,
+    "builds": [
+      {
+        "src": "server.js",
+        "use": "@vercel/node",
+        "config": {
+          "nodeVersion": "18.x"
         }
-    ]
-}
+      }
+    ],
+    "routes": [
+      {
+        "src": "/api/(.*)",
+        "dest": "server.js"
+      },
+      {
+        "src": "/auth/(.*)",
+        "dest": "server.js"
+      },
+      {
+        "src": "/(.*)",
+        "dest": "server.js"
+      }
+    ],
+    "env": {
+      "NODE_ENV": "production"
+    }
+  }
